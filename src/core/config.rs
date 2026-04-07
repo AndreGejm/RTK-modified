@@ -18,6 +18,8 @@ pub struct Config {
     #[serde(default)]
     pub telemetry: TelemetryConfig,
     #[serde(default)]
+    pub evaluation: EvaluationConfig,
+    #[serde(default)]
     pub hooks: HooksConfig,
     #[serde(default)]
     pub limits: LimitsConfig,
@@ -100,6 +102,17 @@ impl Default for TelemetryConfig {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct EvaluationConfig {
+    pub enabled: bool,
+}
+
+impl Default for EvaluationConfig {
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct LimitsConfig {
     /// Max total grep results to show (default: 200)
     pub grep_max_results: usize,
@@ -133,6 +146,11 @@ pub fn limits() -> LimitsConfig {
 /// Check if telemetry is enabled in config. Returns None if config can't be loaded.
 pub fn telemetry_enabled() -> Option<bool> {
     Config::load().ok().map(|c| c.telemetry.enabled)
+}
+
+/// Check if evaluation logging is enabled in config. Returns None if config can't be loaded.
+pub fn evaluation_enabled() -> Option<bool> {
+    Config::load().ok().map(|c| c.evaluation.enabled)
 }
 
 impl Config {
@@ -219,5 +237,32 @@ history_days = 90
 "#;
         let config: Config = toml::from_str(toml).expect("valid toml");
         assert!(config.hooks.exclude_commands.is_empty());
+    }
+
+    #[test]
+    fn test_evaluation_config_default_disabled() {
+        let config = Config::default();
+        assert!(!config.evaluation.enabled);
+    }
+
+    #[test]
+    fn test_evaluation_config_deserializes() {
+        let toml = r#"
+[evaluation]
+enabled = true
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(config.evaluation.enabled);
+    }
+
+    #[test]
+    fn test_legacy_config_without_evaluation_section_defaults_disabled() {
+        let toml = r#"
+[tracking]
+enabled = true
+history_days = 90
+"#;
+        let config: Config = toml::from_str(toml).expect("valid toml");
+        assert!(!config.evaluation.enabled);
     }
 }

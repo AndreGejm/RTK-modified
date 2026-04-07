@@ -31,8 +31,9 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection};
-use serde::Serialize;
+use rusqlite::{params, types::Type, Connection};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -57,6 +58,25 @@ fn project_filter_params(project_path: Option<&str>) -> (Option<String>, Option<
             Some(p.to_string()),
             Some(format!("{}{}*", p, std::path::MAIN_SEPARATOR)), // changed: GLOB pattern with * wildcard
         ),
+        None => (None, None),
+    }
+}
+
+/// Build literal-safe SQL filter params for evaluation project-scoped queries.
+/// Returns (exact_match, literal_prefix) for WHERE clause.
+fn evaluation_project_filter_params(
+    project_path: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    match project_path {
+        Some(p) => {
+            let separator = std::path::MAIN_SEPARATOR;
+            let prefix = if p.ends_with(separator) {
+                p.to_string()
+            } else {
+                format!("{}{}", p, separator)
+            };
+            (Some(p.to_string()), Some(prefix))
+        }
         None => (None, None),
     }
 }
@@ -131,6 +151,75 @@ pub struct GainSummary {
     pub by_command: Vec<(String, usize, usize, f64, u64)>,
     /// Last 30 days of activity: (date, saved_tokens)
     pub by_day: Vec<(String, usize)>,
+}
+
+/// Outcome recorded for an evaluation event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EvaluationOutcome {
+    Compressed,
+    PreservedRaw,
+    PassthroughExpected,
+    FallbackRecovered,
+    HardFailure,
+}
+
+impl EvaluationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compressed => "Compressed",
+            Self::PreservedRaw => "PreservedRaw",
+            Self::PassthroughExpected => "PassthroughExpected",
+            Self::FallbackRecovered => "FallbackRecovered",
+            Self::HardFailure => "HardFailure",
+        }
+    }
+
+    fn from_db_value(value: &str) -> std::io::Result<Self> {
+        match value {
+            "Compressed" => Ok(Self::Compressed),
+            "PreservedRaw" => Ok(Self::PreservedRaw),
+            "PassthroughExpected" => Ok(Self::PassthroughExpected),
+            "FallbackRecovered" => Ok(Self::FallbackRecovered),
+            "HardFailure" => Ok(Self::HardFailure),
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("unknown evaluation outcome: {value}"),
+            )),
+        }
+    }
+
+    fn is_failure(self) -> bool {
+        matches!(self, Self::FallbackRecovered | Self::HardFailure)
+    }
+}
+
+/// Aggregated statistics for recorded evaluation events.
+#[derive(Debug)]
+pub struct EvaluationSummary {
+    pub total_uses: usize,
+    pub successful_uses: usize,
+    pub failed_uses: usize,
+    pub compressed_uses: usize,
+    pub preserved_raw_uses: usize,
+    pub passthrough_uses: usize,
+    pub recovered_failures: usize,
+    pub hard_failures: usize,
+    pub compression_success_rate: f64,
+    pub top_failed_commands: Vec<(String, usize)>,
+    pub recent_failures: Vec<EvaluationFailureRecord>,
+}
+
+/// Individual evaluation event included in summary output.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub struct EvaluationFailureRecord {
+    pub timestamp: DateTime<Utc>,
+    pub original_cmd: String,
+    pub rtk_cmd: String,
+    pub project_path: String,
+    pub outcome: EvaluationOutcome,
+    pub compression_attempted: bool,
+    pub failure_reason: Option<String>,
 }
 
 /// Daily statistics for token savings and execution metrics.
@@ -323,6 +412,24 @@ impl Tracker {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS evaluation_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                original_cmd TEXT NOT NULL,
+                rtk_cmd TEXT NOT NULL,
+                project_path TEXT DEFAULT '',
+                outcome TEXT NOT NULL,
+                compression_attempted INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_project_timestamp ON evaluation_events(project_path, timestamp)",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -395,6 +502,10 @@ impl Tracker {
             "DELETE FROM parse_failures WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
+        self.conn.execute(
+            "DELETE FROM evaluation_events WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -413,6 +524,32 @@ impl Tracker {
                 raw_command,
                 error_message,
                 fallback_succeeded as i32,
+            ],
+        )?;
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// Record an evaluation event for analytics.
+    pub fn record_evaluation(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        outcome: EvaluationOutcome,
+        compression_attempted: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Utc::now().to_rfc3339(),
+                original_cmd,
+                rtk_cmd,
+                current_project_path_string(),
+                outcome.as_str(),
+                compression_attempted as i32,
+                failure_reason,
             ],
         )?;
         self.cleanup_old()?;
@@ -474,6 +611,107 @@ impl Tracker {
             recovery_rate,
             top_commands,
             recent,
+        })
+    }
+
+    /// Get evaluation summary filtered by project path.
+    pub fn get_evaluation_summary_filtered(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<EvaluationSummary> {
+        let (project_exact, project_prefix) = evaluation_project_filter_params(project_path);
+        let project_exact = project_exact.as_deref();
+        let project_prefix = project_prefix.as_deref();
+
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason
+             FROM evaluation_events
+             WHERE (?1 IS NULL OR project_path = ?1 OR instr(project_path, ?2) = 1)
+             ORDER BY timestamp DESC",
+        )?;
+
+        let rows = stmt.query_map(params![project_exact, project_prefix], |row| {
+            let timestamp_raw: String = row.get(0)?;
+            let timestamp = DateTime::parse_from_rfc3339(&timestamp_raw)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(err))
+                })?;
+            let outcome =
+                EvaluationOutcome::from_db_value(&row.get::<_, String>(4)?).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(4, Type::Text, Box::new(err))
+                })?;
+            Ok(EvaluationFailureRecord {
+                timestamp,
+                original_cmd: row.get(1)?,
+                rtk_cmd: row.get(2)?,
+                project_path: row.get(3)?,
+                outcome,
+                compression_attempted: row.get::<_, i32>(5)? != 0,
+                failure_reason: row.get(6)?,
+            })
+        })?;
+
+        let mut total_uses = 0usize;
+        let mut compressed_uses = 0usize;
+        let mut preserved_raw_uses = 0usize;
+        let mut passthrough_uses = 0usize;
+        let mut recovered_failures = 0usize;
+        let mut hard_failures = 0usize;
+        let mut compression_attempted_uses = 0usize;
+        let mut failure_counts: HashMap<String, usize> = HashMap::new();
+        let mut recent_failures = Vec::new();
+
+        for row in rows {
+            let record = row?;
+            total_uses += 1;
+
+            match record.outcome {
+                EvaluationOutcome::Compressed => compressed_uses += 1,
+                EvaluationOutcome::PreservedRaw => preserved_raw_uses += 1,
+                EvaluationOutcome::PassthroughExpected => passthrough_uses += 1,
+                EvaluationOutcome::FallbackRecovered => recovered_failures += 1,
+                EvaluationOutcome::HardFailure => hard_failures += 1,
+            }
+
+            if record.compression_attempted {
+                compression_attempted_uses += 1;
+            }
+
+            if record.outcome.is_failure() {
+                *failure_counts
+                    .entry(record.original_cmd.clone())
+                    .or_insert(0) += 1;
+                if recent_failures.len() < 10 {
+                    recent_failures.push(record);
+                }
+            }
+        }
+
+        let successful_uses = compressed_uses + preserved_raw_uses + passthrough_uses;
+        let failed_uses = recovered_failures + hard_failures;
+
+        let compression_success_rate = if compression_attempted_uses > 0 {
+            (compressed_uses as f64 / compression_attempted_uses as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let mut top_failed_commands: Vec<(String, usize)> = failure_counts.into_iter().collect();
+        top_failed_commands.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        Ok(EvaluationSummary {
+            total_uses,
+            successful_uses,
+            failed_uses,
+            compressed_uses,
+            preserved_raw_uses,
+            passthrough_uses,
+            recovered_failures,
+            hard_failures,
+            compression_success_rate,
+            top_failed_commands,
+            recent_failures,
         })
     }
 
@@ -1163,6 +1401,62 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn rtk_db_path_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct RtkDbPathGuard {
+        _lock: MutexGuard<'static, ()>,
+        original: Option<OsString>,
+        cleanup_path: Option<PathBuf>,
+    }
+
+    impl RtkDbPathGuard {
+        fn with_path(path: PathBuf) -> Self {
+            let lock = rtk_db_path_test_lock()
+                .lock()
+                .expect("Failed to acquire RTK_DB_PATH test lock");
+            let original = std::env::var_os("RTK_DB_PATH");
+            std::env::set_var("RTK_DB_PATH", &path);
+            Self {
+                _lock: lock,
+                original,
+                cleanup_path: Some(path),
+            }
+        }
+
+        fn clear() -> Self {
+            let lock = rtk_db_path_test_lock()
+                .lock()
+                .expect("Failed to acquire RTK_DB_PATH test lock");
+            let original = std::env::var_os("RTK_DB_PATH");
+            std::env::remove_var("RTK_DB_PATH");
+            Self {
+                _lock: lock,
+                original,
+                cleanup_path: None,
+            }
+        }
+    }
+
+    impl Drop for RtkDbPathGuard {
+        fn drop(&mut self) {
+            if let Some(original) = &self.original {
+                std::env::set_var("RTK_DB_PATH", original);
+            } else {
+                std::env::remove_var("RTK_DB_PATH");
+            }
+
+            if let Some(path) = self.cleanup_path.take() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
@@ -1291,21 +1585,16 @@ mod tests {
         use std::env;
 
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
-        env::set_var("RTK_DB_PATH", &custom_path);
+        let _guard = RtkDbPathGuard::with_path(custom_path.clone());
 
         let db_path = get_db_path().expect("Failed to get db path");
         assert_eq!(db_path, custom_path);
-
-        env::remove_var("RTK_DB_PATH");
     }
 
     // 8. get_db_path falls back to default when no custom config
     #[test]
     fn test_default_db_path() {
-        use std::env;
-
-        // Ensure no env var is set
-        env::remove_var("RTK_DB_PATH");
+        let _guard = RtkDbPathGuard::clear();
 
         let db_path = get_db_path().expect("Failed to get db path");
         assert!(db_path.ends_with("rtk/history.db"));
@@ -1388,5 +1677,242 @@ mod tests {
         // We can't assert exact rate because other tests may have added records,
         // but we can verify recovery_rate is between 0 and 100
         assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+    }
+
+    #[test]
+    fn test_record_evaluation_event_roundtrip() {
+        use std::env;
+
+        let db_path = env::temp_dir().join(format!(
+            "rtk_evaluation_test_{}_{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let _guard = RtkDbPathGuard::with_path(db_path.clone());
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        tracker
+            .record_evaluation(
+                "git status",
+                "rtk git status",
+                EvaluationOutcome::Compressed,
+                true,
+                None,
+            )
+            .expect("Failed to record compressed evaluation event");
+        tracker
+            .record_evaluation(
+                "git diff",
+                "rtk git diff",
+                EvaluationOutcome::PreservedRaw,
+                false,
+                None,
+            )
+            .expect("Failed to record preserved raw evaluation event");
+        tracker
+            .record_evaluation(
+                "git show",
+                "rtk git show",
+                EvaluationOutcome::FallbackRecovered,
+                true,
+                Some("retry succeeded"),
+            )
+            .expect("Failed to record recovered evaluation event");
+        tracker
+            .record_evaluation(
+                "git push",
+                "rtk git push",
+                EvaluationOutcome::HardFailure,
+                true,
+                Some("network failure"),
+            )
+            .expect("Failed to record hard failure evaluation event");
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+
+        assert_eq!(summary.total_uses, 4);
+        assert_eq!(summary.successful_uses, 2);
+        assert_eq!(summary.failed_uses, 2);
+        assert_eq!(summary.compressed_uses, 1);
+        assert_eq!(summary.preserved_raw_uses, 1);
+        assert_eq!(summary.passthrough_uses, 0);
+        assert_eq!(summary.recovered_failures, 1);
+        assert_eq!(summary.hard_failures, 1);
+        assert!((summary.compression_success_rate - 33.33333333333333).abs() < 0.01);
+        assert_eq!(summary.top_failed_commands.len(), 2);
+        assert!(summary
+            .top_failed_commands
+            .iter()
+            .any(|(cmd, count)| cmd == "git push" && *count == 1));
+        assert!(summary
+            .top_failed_commands
+            .iter()
+            .any(|(cmd, count)| cmd == "git show" && *count == 1));
+        assert_eq!(summary.recent_failures.len(), 2);
+        assert_eq!(summary.recent_failures[0].original_cmd, "git push");
+        assert_eq!(
+            summary.recent_failures[0].failure_reason.as_deref(),
+            Some("network failure")
+        );
+    }
+
+    #[test]
+    fn test_evaluation_summary_filtered_uses_literal_project_prefix() {
+        use std::env;
+
+        let db_path = env::temp_dir().join(format!(
+            "rtk_evaluation_scope_{}_{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let _guard = RtkDbPathGuard::with_path(db_path.clone());
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let separator = std::path::MAIN_SEPARATOR.to_string();
+        let project_path = format!("C:{}work{}proj[abc]?", separator, separator);
+        let project_child = format!("{}{}subdir", project_path, separator);
+        let unrelated_path = format!("C:{}work{}other", separator, separator);
+
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "2026-04-07T10:00:00Z",
+                    "git status",
+                    "rtk git status",
+                    project_path,
+                    EvaluationOutcome::Compressed.as_str(),
+                    1i32,
+                    Option::<String>::None,
+                ],
+            )
+            .expect("Failed to insert base evaluation row");
+
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "2026-04-07T10:01:00Z",
+                    "git diff",
+                    "rtk git diff",
+                    project_child,
+                    EvaluationOutcome::FallbackRecovered.as_str(),
+                    1i32,
+                    Some("fallback used"),
+                ],
+            )
+            .expect("Failed to insert child evaluation row");
+
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "2026-04-07T10:02:00Z",
+                    "git push",
+                    "rtk git push",
+                    unrelated_path,
+                    EvaluationOutcome::HardFailure.as_str(),
+                    1i32,
+                    Some("unrelated"),
+                ],
+            )
+            .expect("Failed to insert unrelated evaluation row");
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(Some(&project_path))
+            .expect("Failed to get filtered evaluation summary");
+
+        assert_eq!(summary.total_uses, 2);
+        assert_eq!(summary.successful_uses, 1);
+        assert_eq!(summary.failed_uses, 1);
+        assert_eq!(summary.compressed_uses, 1);
+        assert_eq!(summary.preserved_raw_uses, 0);
+        assert_eq!(summary.passthrough_uses, 0);
+        assert_eq!(summary.recovered_failures, 1);
+        assert_eq!(summary.hard_failures, 0);
+        assert!((summary.compression_success_rate - 50.0).abs() < 0.01);
+        assert_eq!(
+            summary.top_failed_commands,
+            vec![("git diff".to_string(), 1)]
+        );
+        assert_eq!(summary.recent_failures.len(), 1);
+        assert_eq!(summary.recent_failures[0].original_cmd, "git diff");
+    }
+
+    #[test]
+    fn test_evaluation_summary_rejects_unknown_outcome() {
+        use std::env;
+
+        let db_path = env::temp_dir().join(format!(
+            "rtk_evaluation_unknown_outcome_{}_{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let _guard = RtkDbPathGuard::with_path(db_path.clone());
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    Utc::now().to_rfc3339(),
+                    "git status",
+                    "rtk git status",
+                    "",
+                    "UnexpectedOutcome",
+                    1i32,
+                    Option::<String>::None,
+                ],
+            )
+            .expect("Failed to insert malformed evaluation row");
+
+        let result = tracker.get_evaluation_summary_filtered(None);
+        assert!(result.is_err(), "expected unknown outcome to error");
+    }
+
+    #[test]
+    fn test_evaluation_summary_rejects_invalid_timestamp() {
+        use std::env;
+
+        let db_path = env::temp_dir().join(format!(
+            "rtk_evaluation_bad_timestamp_{}_{}.db",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+
+        let _guard = RtkDbPathGuard::with_path(db_path.clone());
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        tracker
+            .conn
+            .execute(
+                "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    "not-a-timestamp",
+                    "git diff",
+                    "rtk git diff",
+                    "",
+                    EvaluationOutcome::Compressed.as_str(),
+                    1i32,
+                    Option::<String>::None,
+                ],
+            )
+            .expect("Failed to insert malformed evaluation row");
+
+        let result = tracker.get_evaluation_summary_filtered(None);
+        assert!(result.is_err(), "expected invalid timestamp to error");
     }
 }
