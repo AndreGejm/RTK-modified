@@ -38,6 +38,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use super::config::evaluation_enabled;
+
 // ── Project path helpers ── // added: project-scoped tracking support
 
 /// Get the canonical project path string for the current working directory.
@@ -539,6 +541,25 @@ impl Tracker {
         compression_attempted: bool,
         failure_reason: Option<&str>,
     ) -> Result<()> {
+        self.insert_evaluation_event(
+            original_cmd,
+            rtk_cmd,
+            outcome,
+            compression_attempted,
+            failure_reason,
+            true,
+        )
+    }
+
+    fn insert_evaluation_event(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        outcome: EvaluationOutcome,
+        compression_attempted: bool,
+        failure_reason: Option<&str>,
+        run_cleanup: bool,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -552,7 +573,9 @@ impl Tracker {
                 failure_reason,
             ],
         )?;
-        self.cleanup_old()?;
+        if run_cleanup {
+            self.cleanup_old()?;
+        }
         Ok(())
     }
 
@@ -1333,19 +1356,23 @@ impl TimedExecution {
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
     pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
         let input_tokens = estimate_tokens(input);
         let output_tokens = estimate_tokens(output);
+        let outcome = if output_tokens < input_tokens {
+            EvaluationOutcome::Compressed
+        } else {
+            EvaluationOutcome::PreservedRaw
+        };
 
-        if let Ok(tracker) = Tracker::new() {
-            let _ = tracker.record(
-                original_cmd,
-                rtk_cmd,
-                input_tokens,
-                output_tokens,
-                elapsed_ms,
-            );
-        }
+        self.record_with_outcome(
+            original_cmd,
+            rtk_cmd,
+            input_tokens,
+            output_tokens,
+            outcome,
+            input_tokens > 0,
+            None,
+        );
     }
 
     /// Track passthrough commands (timing-only, no token counting).
@@ -1369,10 +1396,62 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
+        self.record_with_outcome(
+            original_cmd,
+            rtk_cmd,
+            0,
+            0,
+            EvaluationOutcome::PassthroughExpected,
+            false,
+            None,
+        );
+    }
+
+    /// Track a passthrough command with an explicit evaluation outcome.
+    ///
+    /// This is used for fallback and hard-failure flows where RTK keeps the
+    /// original command behavior but still wants to record the evaluation result.
+    pub fn track_passthrough_outcome(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        outcome: EvaluationOutcome,
+        failure_reason: Option<&str>,
+    ) {
+        self.record_with_outcome(original_cmd, rtk_cmd, 0, 0, outcome, false, failure_reason);
+    }
+
+    fn record_with_outcome(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        input_tokens: usize,
+        output_tokens: usize,
+        outcome: EvaluationOutcome,
+        compression_attempted: bool,
+        failure_reason: Option<&str>,
+    ) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        // input_tokens=0, output_tokens=0 won't dilute savings statistics
+
         if let Ok(tracker) = Tracker::new() {
-            let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
+            let _ = tracker.record(
+                original_cmd,
+                rtk_cmd,
+                input_tokens,
+                output_tokens,
+                elapsed_ms,
+            );
+
+            if matches!(evaluation_enabled(), Some(true)) {
+                let _ = tracker.insert_evaluation_event(
+                    original_cmd,
+                    rtk_cmd,
+                    outcome,
+                    compression_attempted,
+                    failure_reason,
+                    false,
+                );
+            }
         }
     }
 }
@@ -1408,6 +1487,15 @@ mod tests {
     fn rtk_db_path_test_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_test_db_path(prefix: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}.db",
+            prefix,
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
     }
 
     struct RtkDbPathGuard {
@@ -1550,6 +1638,8 @@ mod tests {
     // 5. TimedExecution::track records with exec_time > 0
     #[test]
     fn test_timed_execution_records_time() {
+        let _db_guard = RtkDbPathGuard::with_path(unique_test_db_path("rtk_timed_execution_track"));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(true));
         let timer = TimedExecution::start();
         std::thread::sleep(std::time::Duration::from_millis(10));
         timer.track("test cmd", "rtk test", "raw input data", "filtered");
@@ -1558,11 +1648,40 @@ mod tests {
         let tracker = Tracker::new().expect("Failed to create tracker");
         let recent = tracker.get_recent(5).expect("Failed to get recent");
         assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+        assert_eq!(summary.compressed_uses, 1);
+        assert_eq!(summary.successful_uses, 1);
     }
 
-    // 6. TimedExecution::track_passthrough records with 0 tokens
+    // 6. TimedExecution::track records preserved raw outcomes
+    #[test]
+    fn test_timed_execution_preserved_raw() {
+        let _db_guard =
+            RtkDbPathGuard::with_path(unique_test_db_path("rtk_timed_execution_preserved_raw"));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(true));
+        let timer = TimedExecution::start();
+        timer.track("test cmd", "rtk test", "abcd", "abcdefgh");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+        assert_eq!(summary.preserved_raw_uses, 1);
+        assert_eq!(summary.compressed_uses, 0);
+    }
+
+    // 7. TimedExecution::track_passthrough records with 0 tokens
     #[test]
     fn test_timed_execution_passthrough() {
+        let _db_guard =
+            RtkDbPathGuard::with_path(unique_test_db_path("rtk_timed_execution_passthrough"));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(true));
         let timer = TimedExecution::start();
         timer.track_passthrough("git tag", "rtk git tag (passthrough)");
 
@@ -1577,6 +1696,64 @@ mod tests {
         // savings_pct should be 0 for passthrough
         assert_eq!(pt.savings_pct, 0.0);
         assert_eq!(pt.saved_tokens, 0);
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+        assert_eq!(summary.passthrough_uses, 1);
+        assert_eq!(summary.failed_uses, 0);
+    }
+
+    #[test]
+    fn test_timed_execution_passthrough_outcome_records_failure_reason() {
+        let _db_guard = RtkDbPathGuard::with_path(unique_test_db_path(
+            "rtk_timed_execution_passthrough_outcome",
+        ));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(true));
+        let timer = TimedExecution::start();
+        timer.track_passthrough_outcome(
+            "git push",
+            "rtk git push",
+            EvaluationOutcome::HardFailure,
+            Some("network failure"),
+        );
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+
+        assert_eq!(summary.total_uses, 1);
+        assert_eq!(summary.failed_uses, 1);
+        assert_eq!(summary.recovered_failures, 0);
+        assert_eq!(summary.hard_failures, 1);
+        assert_eq!(summary.compressed_uses, 0);
+        assert_eq!(summary.compression_success_rate, 0.0);
+        assert_eq!(summary.recent_failures.len(), 1);
+        assert_eq!(
+            summary.recent_failures[0].failure_reason.as_deref(),
+            Some("network failure")
+        );
+        assert_eq!(summary.recent_failures[0].original_cmd, "git push");
+    }
+
+    #[test]
+    fn test_timed_execution_preserves_token_tracking_when_evaluation_disabled() {
+        let _db_guard =
+            RtkDbPathGuard::with_path(unique_test_db_path("rtk_timed_execution_eval_disabled"));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(false));
+        let timer = TimedExecution::start();
+        timer.track("git status", "rtk git status", "long raw output", "short");
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let recent = tracker.get_recent(5).expect("Failed to get recent");
+        assert!(recent.iter().any(|r| r.rtk_cmd == "rtk git status"));
+
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+
+        assert_eq!(summary.total_uses, 0);
     }
 
     // 7. get_db_path respects environment variable RTK_DB_PATH

@@ -3,6 +3,8 @@
 use super::constants::{CONFIG_TOML, DEFAULT_HISTORY_DAYS, RTK_DATA_DIR};
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -150,7 +152,79 @@ pub fn telemetry_enabled() -> Option<bool> {
 
 /// Check if evaluation logging is enabled in config. Returns None if config can't be loaded.
 pub fn evaluation_enabled() -> Option<bool> {
+    #[cfg(test)]
+    if let Some(enabled) = evaluation_enabled_override() {
+        return Some(enabled);
+    }
+
     Config::load().ok().map(|c| c.evaluation.enabled)
+}
+
+#[cfg(test)]
+thread_local! {
+    static EVALUATION_ENABLED_OVERRIDE: RefCell<Option<bool>> = RefCell::new(None);
+    static CONFIG_PATH_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+}
+
+#[cfg(test)]
+fn evaluation_enabled_override() -> Option<bool> {
+    EVALUATION_ENABLED_OVERRIDE.with(|slot| *slot.borrow())
+}
+
+#[cfg(test)]
+pub(crate) struct EvaluationEnabledOverrideGuard {
+    previous: Option<bool>,
+}
+
+#[cfg(test)]
+impl EvaluationEnabledOverrideGuard {
+    pub(crate) fn set(enabled: Option<bool>) -> Self {
+        let previous = EVALUATION_ENABLED_OVERRIDE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let previous = *slot;
+            *slot = enabled;
+            previous
+        });
+
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for EvaluationEnabledOverrideGuard {
+    fn drop(&mut self) {
+        EVALUATION_ENABLED_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = self.previous;
+        });
+    }
+}
+
+#[cfg(test)]
+pub(crate) struct ConfigPathOverrideGuard {
+    previous: Option<PathBuf>,
+}
+
+#[cfg(test)]
+impl ConfigPathOverrideGuard {
+    pub(crate) fn set(path: PathBuf) -> Self {
+        let previous = CONFIG_PATH_OVERRIDE.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let previous = slot.clone();
+            *slot = Some(path);
+            previous
+        });
+
+        Self { previous }
+    }
+}
+
+#[cfg(test)]
+impl Drop for ConfigPathOverrideGuard {
+    fn drop(&mut self) {
+        CONFIG_PATH_OVERRIDE.with(|slot| {
+            *slot.borrow_mut() = self.previous.clone();
+        });
+    }
 }
 
 impl Config {
@@ -186,6 +260,11 @@ impl Config {
 }
 
 fn get_config_path() -> Result<PathBuf> {
+    #[cfg(test)]
+    if let Some(path) = CONFIG_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return Ok(path.join(RTK_DATA_DIR).join(CONFIG_TOML));
+    }
+
     let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
     Ok(config_dir.join(RTK_DATA_DIR).join(CONFIG_TOML))
 }
@@ -264,5 +343,32 @@ history_days = 90
 "#;
         let config: Config = toml::from_str(toml).expect("valid toml");
         assert!(!config.evaluation.enabled);
+    }
+
+    #[test]
+    fn test_evaluation_enabled_override_is_thread_local() {
+        let config_root = std::env::temp_dir().join(format!(
+            "rtk_config_override_scope_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        let _config_guard = ConfigPathOverrideGuard::set(config_root.clone());
+        let _override = EvaluationEnabledOverrideGuard::set(Some(true));
+        assert_eq!(evaluation_enabled(), Some(true));
+
+        let handle = std::thread::spawn(move || {
+            let _config_guard = ConfigPathOverrideGuard::set(config_root);
+            evaluation_enabled()
+        });
+
+        assert_eq!(
+            handle.join().expect("scope test thread panicked"),
+            Some(false)
+        );
+
+        assert_eq!(evaluation_enabled(), Some(true));
     }
 }
