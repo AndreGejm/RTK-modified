@@ -374,6 +374,9 @@ enum Commands {
         /// Filter statistics to current project (current working directory) // added
         #[arg(short, long)]
         project: bool,
+        /// Show the evaluation report
+        #[arg(long)]
+        evaluation: bool,
         /// Show ASCII graph of daily savings
         #[arg(short, long)]
         graph: bool,
@@ -1691,6 +1694,7 @@ fn run_cli() -> Result<i32> {
 
         Commands::Gain {
             project, // added
+            evaluation,
             graph,
             history,
             quota,
@@ -1704,6 +1708,7 @@ fn run_cli() -> Result<i32> {
         } => {
             analytics::gain::run(
                 project, // added: pass project flag
+                evaluation,
                 graph,
                 history,
                 quota,
@@ -2413,6 +2418,18 @@ mod tests {
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Gain { failures, .. } => assert!(failures),
+                _ => panic!("Expected Gain command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gain_evaluation_flag_parses() {
+        let result = Cli::try_parse_from(["rtk", "gain", "--evaluation"]);
+        assert!(result.is_ok());
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Gain { evaluation, .. } => assert!(evaluation),
                 _ => panic!("Expected Gain command"),
             }
         }

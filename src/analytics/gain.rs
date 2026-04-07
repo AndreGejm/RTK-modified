@@ -1,19 +1,21 @@
 //! Shows users how many tokens RTK has saved them over time.
 
 use crate::core::display_helpers::{format_duration, print_period_table};
-use crate::core::tracking::{DayStats, MonthStats, Tracker, WeekStats};
+use crate::core::tracking::{DayStats, EvaluationSummary, MonthStats, Tracker, WeekStats};
 use crate::core::utils::format_tokens;
 use crate::hooks::hook_check;
 use anyhow::{Context, Result};
 use chrono::Local;
 use colored::Colorize;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     project: bool, // added: per-project scope flag
+    evaluation: bool,
     graph: bool,
     history: bool,
     quota: bool,
@@ -28,6 +30,10 @@ pub fn run(
 ) -> Result<()> {
     let tracker = Tracker::new().context("Failed to initialize tracking database")?;
     let project_scope = resolve_project_scope(project)?; // added: resolve project path
+
+    if evaluation {
+        return show_evaluation(&tracker, project_scope.as_deref());
+    }
 
     if failures {
         return show_failures(&tracker);
@@ -621,6 +627,102 @@ fn export_csv(
     Ok(())
 }
 
+fn show_evaluation(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    let summary = tracker
+        .get_evaluation_summary_filtered(project_scope)
+        .context("Failed to load evaluation summary from database")?;
+    println!("{}", format_evaluation_report(&summary, project_scope));
+    Ok(())
+}
+
+fn format_evaluation_report(summary: &EvaluationSummary, project_scope: Option<&str>) -> String {
+    let mut out = String::new();
+
+    if summary.total_uses == 0 {
+        writeln!(&mut out, "No evaluation data yet.").expect("write evaluation empty title");
+        if let Some(scope) = project_scope {
+            writeln!(&mut out, "Scope: {}", shorten_path(scope)).expect("write evaluation scope");
+        }
+        writeln!(
+            &mut out,
+            "Run some rtk commands with evaluation logging enabled to start tracking results."
+        )
+        .expect("write evaluation empty guidance");
+        return out;
+    }
+
+    writeln!(&mut out, "RTK Evaluation").expect("write evaluation title");
+    if let Some(scope) = project_scope {
+        writeln!(&mut out, "Scope: {}", shorten_path(scope)).expect("write evaluation scope");
+    }
+    writeln!(&mut out, "{}", "─".repeat(60)).expect("write evaluation divider");
+    writeln!(&mut out, "Total RTK uses: {}", summary.total_uses).expect("write total uses");
+    writeln!(&mut out, "Successful uses: {}", summary.successful_uses)
+        .expect("write successful uses");
+    writeln!(&mut out, "Failed uses: {}", summary.failed_uses).expect("write failed uses");
+    writeln!(
+        &mut out,
+        "Compression attempts: {}",
+        summary.compression_attempts
+    )
+    .expect("write compression attempts");
+    writeln!(
+        &mut out,
+        "Compression success rate: {:.1}%",
+        summary.compression_success_rate
+    )
+    .expect("write compression success rate");
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Breakdown by outcome").expect("write breakdown title");
+    writeln!(&mut out, "  compressed: {}", summary.compressed_uses).expect("write compressed");
+    writeln!(&mut out, "  preserved_raw: {}", summary.preserved_raw_uses)
+        .expect("write preserved raw");
+    writeln!(
+        &mut out,
+        "  passthrough_expected: {}",
+        summary.passthrough_uses
+    )
+    .expect("write passthrough");
+    writeln!(
+        &mut out,
+        "  fallback_recovered: {}",
+        summary.recovered_failures
+    )
+    .expect("write recovered failures");
+    writeln!(&mut out, "  hard_failure: {}", summary.hard_failures).expect("write hard failures");
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Top failed commands").expect("write top failed commands title");
+    if summary.top_failed_commands.is_empty() {
+        writeln!(&mut out, "  None").expect("write empty top failed commands");
+    } else {
+        for (index, (command, count)) in summary.top_failed_commands.iter().enumerate() {
+            writeln!(&mut out, "  {}. {} ({})", index + 1, command, count)
+                .expect("write top failed command row");
+        }
+    }
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Recent failures").expect("write recent failures title");
+    if summary.recent_failures.is_empty() {
+        writeln!(&mut out, "  None").expect("write empty recent failures");
+    } else {
+        for record in &summary.recent_failures {
+            writeln!(
+                &mut out,
+                "  {} | {} | {}",
+                record.timestamp.to_rfc3339(),
+                record.original_cmd,
+                record.failure_reason.as_deref().unwrap_or("n/a")
+            )
+            .expect("write recent failure row");
+        }
+    }
+
+    out
+}
+
 /// Lightweight scan of recent Claude Code sessions for RTK_DISABLED= overuse.
 /// Returns a warning string if bypass rate exceeds 10%, None otherwise.
 /// Silently returns None on any error (missing dirs, permission issues, etc.).
@@ -724,4 +826,77 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::tracking::{EvaluationFailureRecord, EvaluationOutcome, EvaluationSummary};
+
+    #[test]
+    fn test_format_evaluation_report_shows_core_counts() {
+        let summary = EvaluationSummary {
+            total_uses: 20,
+            successful_uses: 18,
+            failed_uses: 2,
+            compressed_uses: 12,
+            preserved_raw_uses: 4,
+            passthrough_uses: 2,
+            recovered_failures: 1,
+            hard_failures: 1,
+            compression_attempts: 16,
+            compression_success_rate: 75.0,
+            top_failed_commands: vec![("unknowncmd".into(), 2)],
+            recent_failures: vec![EvaluationFailureRecord {
+                timestamp: chrono::DateTime::parse_from_rfc3339("2026-04-07T12:34:00Z")
+                    .expect("valid timestamp")
+                    .with_timezone(&chrono::Utc),
+                original_cmd: "unknowncmd".into(),
+                rtk_cmd: "rtk fallback: unknowncmd".into(),
+                project_path: "/tmp/project".into(),
+                outcome: EvaluationOutcome::FallbackRecovered,
+                compression_attempted: false,
+                failure_reason: Some("clap parse fallback".into()),
+            }],
+        };
+
+        let text = format_evaluation_report(&summary, Some("/tmp/project"));
+        assert!(text.contains("RTK Evaluation"));
+        assert!(text.contains("Scope:"));
+        assert!(text.contains("Total RTK uses"));
+        assert!(text.contains("Successful uses"));
+        assert!(text.contains("Failed uses"));
+        assert!(text.contains("Compression attempts"));
+        assert!(text.contains("Compression success rate"));
+        assert!(text.contains("Breakdown by outcome"));
+        assert!(text.contains("Top failed commands"));
+        assert!(text.contains("Recent failures"));
+        assert!(text.contains("unknowncmd"));
+        assert!(text.contains("clap parse fallback"));
+    }
+
+    #[test]
+    fn test_format_evaluation_report_empty_db_shows_no_data_message() {
+        let summary = EvaluationSummary {
+            total_uses: 0,
+            successful_uses: 0,
+            failed_uses: 0,
+            compressed_uses: 0,
+            preserved_raw_uses: 0,
+            passthrough_uses: 0,
+            recovered_failures: 0,
+            hard_failures: 0,
+            compression_attempts: 0,
+            compression_success_rate: 0.0,
+            top_failed_commands: Vec::new(),
+            recent_failures: Vec::new(),
+        };
+
+        let text = format_evaluation_report(&summary, Some("/tmp/project"));
+        assert!(text.contains("No evaluation data yet."));
+        assert!(text.contains("Scope:"));
+        assert!(text.contains("evaluation logging enabled"));
+        assert!(!text.contains("RTK Evaluation"));
+        assert!(!text.contains("Compression attempts:"));
+    }
 }

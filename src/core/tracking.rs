@@ -206,6 +206,7 @@ pub struct EvaluationSummary {
     pub passthrough_uses: usize,
     pub recovered_failures: usize,
     pub hard_failures: usize,
+    pub compression_attempts: usize,
     pub compression_success_rate: f64,
     pub top_failed_commands: Vec<(String, usize)>,
     pub recent_failures: Vec<EvaluationFailureRecord>,
@@ -732,6 +733,7 @@ impl Tracker {
             passthrough_uses,
             recovered_failures,
             hard_failures,
+            compression_attempts: compression_attempted_uses,
             compression_success_rate,
             top_failed_commands,
             recent_failures,
@@ -1941,6 +1943,7 @@ mod tests {
         assert_eq!(summary.passthrough_uses, 0);
         assert_eq!(summary.recovered_failures, 1);
         assert_eq!(summary.hard_failures, 1);
+        assert_eq!(summary.compression_attempts, 3);
         assert!((summary.compression_success_rate - 33.33333333333333).abs() < 0.01);
         assert_eq!(summary.top_failed_commands.len(), 2);
         assert!(summary
