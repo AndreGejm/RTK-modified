@@ -103,15 +103,9 @@ impl Default for TelemetryConfig {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default)]
 pub struct EvaluationConfig {
     pub enabled: bool,
-}
-
-impl Default for EvaluationConfig {
-    fn default() -> Self {
-        Self { enabled: false }
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -162,8 +156,8 @@ pub fn evaluation_enabled() -> Option<bool> {
 
 #[cfg(test)]
 thread_local! {
-    static EVALUATION_ENABLED_OVERRIDE: RefCell<Option<bool>> = RefCell::new(None);
-    static CONFIG_PATH_OVERRIDE: RefCell<Option<PathBuf>> = RefCell::new(None);
+    static EVALUATION_ENABLED_OVERRIDE: RefCell<Option<bool>> = const { RefCell::new(None) };
+    static CONFIG_PATH_OVERRIDE: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 #[cfg(test)]

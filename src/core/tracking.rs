@@ -534,6 +534,7 @@ impl Tracker {
     }
 
     /// Record an evaluation event for analytics.
+    #[allow(dead_code)]
     pub fn record_evaluation(
         &self,
         original_cmd: &str,
@@ -1311,6 +1312,12 @@ pub struct TimedExecution {
     start: Instant,
 }
 
+struct EvaluationWrite<'a> {
+    outcome: EvaluationOutcome,
+    compression_attempted: bool,
+    failure_reason: Option<&'a str>,
+}
+
 impl TimedExecution {
     /// Start timing a command execution.
     ///
@@ -1371,9 +1378,11 @@ impl TimedExecution {
             rtk_cmd,
             input_tokens,
             output_tokens,
-            outcome,
-            input_tokens > 0,
-            None,
+            EvaluationWrite {
+                outcome,
+                compression_attempted: input_tokens > 0,
+                failure_reason: None,
+            },
         );
     }
 
@@ -1403,9 +1412,11 @@ impl TimedExecution {
             rtk_cmd,
             0,
             0,
-            EvaluationOutcome::PassthroughExpected,
-            false,
-            None,
+            EvaluationWrite {
+                outcome: EvaluationOutcome::PassthroughExpected,
+                compression_attempted: false,
+                failure_reason: None,
+            },
         );
     }
 
@@ -1420,7 +1431,17 @@ impl TimedExecution {
         outcome: EvaluationOutcome,
         failure_reason: Option<&str>,
     ) {
-        self.record_with_outcome(original_cmd, rtk_cmd, 0, 0, outcome, false, failure_reason);
+        self.record_with_outcome(
+            original_cmd,
+            rtk_cmd,
+            0,
+            0,
+            EvaluationWrite {
+                outcome,
+                compression_attempted: false,
+                failure_reason,
+            },
+        );
     }
 
     fn record_with_outcome(
@@ -1429,9 +1450,7 @@ impl TimedExecution {
         rtk_cmd: &str,
         input_tokens: usize,
         output_tokens: usize,
-        outcome: EvaluationOutcome,
-        compression_attempted: bool,
-        failure_reason: Option<&str>,
+        evaluation: EvaluationWrite<'_>,
     ) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
 
@@ -1448,9 +1467,9 @@ impl TimedExecution {
                 let _ = tracker.insert_evaluation_event(
                     original_cmd,
                     rtk_cmd,
-                    outcome,
-                    compression_attempted,
-                    failure_reason,
+                    evaluation.outcome,
+                    evaluation.compression_attempted,
+                    evaluation.failure_reason,
                     false,
                 );
             }

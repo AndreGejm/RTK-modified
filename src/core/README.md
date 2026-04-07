@@ -81,6 +81,9 @@ directory = "/custom/tee/dir"
 [telemetry]
 enabled = true
 
+[evaluation]
+enabled = false
+
 [hooks]
 exclude_commands = ["curl", "playwright"]  # Never auto-rewrite these
 
@@ -90,6 +93,22 @@ grep_max_per_file = 25
 status_max_files = 15
 status_max_untracked = 10
 passthrough_max_chars = 2000
+```
+
+## Evaluation Logger
+
+Temporary rollout/evaluation metrics can be enabled in `config.toml`:
+
+```toml
+[evaluation]
+enabled = true
+```
+
+Then inspect the current report with:
+
+```bash
+rtk gain --evaluation
+rtk gain --evaluation --project
 ```
 
 ## Shared Utilities (utils.rs)
