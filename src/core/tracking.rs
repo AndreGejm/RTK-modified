@@ -1705,6 +1705,29 @@ mod tests {
     }
 
     #[test]
+    fn test_timed_execution_passthrough_outcome_records_fallback_recovered() {
+        let _db_guard = RtkDbPathGuard::with_path(unique_test_db_path(
+            "rtk_timed_execution_fallback_recovered",
+        ));
+        let _guard = super::super::config::EvaluationEnabledOverrideGuard::set(Some(true));
+        let timer = TimedExecution::start();
+        timer.track_passthrough_outcome(
+            "unknowncmd --flag",
+            "rtk fallback: unknowncmd --flag",
+            EvaluationOutcome::FallbackRecovered,
+            Some("parse failure"),
+        );
+
+        let tracker = Tracker::new().expect("Failed to create tracker");
+        let summary = tracker
+            .get_evaluation_summary_filtered(None)
+            .expect("Failed to get evaluation summary");
+
+        assert_eq!(summary.recovered_failures, 1);
+        assert_eq!(summary.failed_uses, 1);
+    }
+
+    #[test]
     fn test_timed_execution_passthrough_outcome_records_failure_reason() {
         let _db_guard = RtkDbPathGuard::with_path(unique_test_db_path(
             "rtk_timed_execution_passthrough_outcome",

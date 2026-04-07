@@ -1127,6 +1127,12 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
                 Ok(exit_code)
             }
             Err(e) => {
+                timer.track_passthrough_outcome(
+                    &raw_command,
+                    &format!("rtk fallback: {}", raw_command),
+                    core::tracking::EvaluationOutcome::HardFailure,
+                    Some("fallback exec failed"),
+                );
                 // Command not found — same behaviour as no-TOML path
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
                 eprintln!("[rtk: {}]", e);
@@ -1144,13 +1150,24 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
         match status {
             Ok(s) => {
-                timer.track_passthrough(&raw_command, &format!("rtk fallback: {}", raw_command));
+                timer.track_passthrough_outcome(
+                    &raw_command,
+                    &format!("rtk fallback: {}", raw_command),
+                    core::tracking::EvaluationOutcome::FallbackRecovered,
+                    Some("parse failure"),
+                );
 
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
                 Ok(core::utils::exit_code_from_status(&s, &raw_command))
             }
             Err(e) => {
+                timer.track_passthrough_outcome(
+                    &raw_command,
+                    &format!("rtk fallback: {}", raw_command),
+                    core::tracking::EvaluationOutcome::HardFailure,
+                    Some("fallback exec failed"),
+                );
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
                 // Command not found or other OS error — single message, no duplicate Clap error
                 eprintln!("[rtk: {}]", e);
