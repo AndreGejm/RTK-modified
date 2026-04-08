@@ -1,0 +1,18 @@
+name: rtk-catalog
+displayName: RTK Local Catalog
+registry:
+  rtk-codex:
+    title: RTK Codex Rewrite Server
+    description: Rewrite shell commands into RTK-prefixed forms for Codex and Docker MCP clients.
+    type: server
+    image: rtk-codex-mcp:local
+    readme: https://github.com/rtk-ai/rtk/tree/master/hooks/codex
+    metadata:
+      owner: AndreGejm
+      category: developer-tools
+      tags:
+        - rtk
+        - codex
+        - token-savings
+    tools:
+      - name: rtk_rewrite_command
