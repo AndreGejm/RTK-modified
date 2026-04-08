@@ -1,0 +1,5 @@
+name: rtk-codex
+title: RTK Codex Rewrite Server
+type: server
+image: rtk-codex-mcp:local
+description: MCP server that rewrites shell commands into RTK-prefixed forms for Codex.

@@ -1,0 +1,15 @@
+FROM rust:1.88-bookworm AS builder
+
+WORKDIR /src
+COPY . .
+RUN cargo build --release
+
+FROM node:24-bookworm-slim
+
+WORKDIR /opt/rtk
+ENV RTK_BIN=/usr/local/bin/rtk
+
+COPY --from=builder /src/target/release/rtk /usr/local/bin/rtk
+COPY hooks/codex/rtk-mcp-server.mjs /opt/rtk/server.mjs
+
+CMD ["node", "/opt/rtk/server.mjs"]
