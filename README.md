@@ -317,7 +317,7 @@ RTK supports 10 AI coding tools. Each integration transparently rewrites shell c
 | **GitHub Copilot CLI** | `rtk init -g --copilot` | PreToolUse deny-with-suggestion (CLI limitation) |
 | **Cursor** | `rtk init -g --agent cursor` | preToolUse hook (hooks.json) |
 | **Gemini CLI** | `rtk init -g --gemini` | BeforeTool hook (`rtk hook gemini`) |
-| **Codex** | `rtk init -g --codex` | AGENTS.md + RTK.md instructions |
+| **Codex** | `rtk init -g --codex` | AGENTS.md + RTK.md instructions, plus Windows PATH launcher shim |
 | **Windsurf** | `rtk init --agent windsurf` | .windsurfrules (project-scoped) |
 | **Cline / Roo Code** | `rtk init --agent cline` | .clinerules (project-scoped) |
 | **OpenCode** | `rtk init -g --opencode` | Plugin TS (tool.execute.before) |
@@ -368,7 +368,7 @@ Creates `~/.gemini/hooks/rtk-hook-gemini.sh` + patches `~/.gemini/settings.json`
 rtk init -g --codex
 ```
 
-Creates `~/.codex/RTK.md` + `~/.codex/AGENTS.md` with `@RTK.md` reference. Codex reads these as global instructions.
+Creates `~/.codex/RTK.md` + `~/.codex/AGENTS.md` with `@RTK.md` reference so Codex reads RTK as global instructions. On Windows, it also installs a PATH-visible launcher shim so Docker-backed or prompt-driven `rtk ...` commands resolve in new workspace shells. Optional Docker MCP assets for Codex live under [`hooks/codex/`](hooks/codex/README.md); `rtk init --codex` does not register the Docker gateway automatically.
 
 ### Windsurf
 

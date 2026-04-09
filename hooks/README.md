@@ -41,6 +41,8 @@ Each agent subdirectory has its own README with hook-specific details:
 - **[`codex/`](codex/README.md)** — Awareness document, `AGENTS.md` integration, `~/.codex/` location
 - **[`opencode/`](opencode/README.md)** — TypeScript plugin, `zx` library, `tool.execute.before` event, in-place mutation
 
+Codex note: the repository also ships optional Docker MCP assets under [`codex/`](codex/README.md), and `rtk init --codex` now installs a Windows PATH launcher shim so host-side `rtk ...` commands resolve in new Codex workspace shells.
+
 ## Supported Agents
 
 | Agent | Mechanism | Hook Type | Can Modify Command? |
@@ -52,7 +54,7 @@ Each agent subdirectory has its own README with hook-specific details:
 | Gemini CLI | Rust binary (`rtk hook gemini`) | Transparent rewrite | Yes (`hookSpecificOutput`) |
 | Cline / Roo Code | Custom instructions (rules file) | Prompt-level guidance | N/A |
 | Windsurf | Custom instructions (rules file) | Prompt-level guidance | N/A |
-| Codex CLI | AGENTS.md / instructions | Prompt-level guidance | N/A |
+| Codex CLI | AGENTS.md / instructions, optional Docker MCP tool | Prompt-level guidance or explicit rewrite tool | Yes via MCP; otherwise N/A |
 | OpenCode | TypeScript plugin (`tool.execute.before`) | In-place mutation | Yes |
 
 ## JSON Formats by Agent

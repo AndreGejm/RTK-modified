@@ -1,6 +1,7 @@
 //! Sets up RTK hooks so AI coding agents automatically route commands through RTK.
 
 use anyhow::{Context, Result};
+use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -689,6 +690,12 @@ fn uninstall_codex_at(codex_dir: &Path, verbose: u8) -> Result<Vec<String>> {
         removed.push("AGENTS.md: removed @RTK.md reference".to_string());
     }
 
+    if let Some(launcher_path) = resolve_codex_rtk_launcher_path()? {
+        if remove_codex_rtk_launcher(&launcher_path, verbose)? {
+            removed.push(format!("Launcher: {}", launcher_path.display()));
+        }
+    }
+
     Ok(removed)
 }
 
@@ -1275,6 +1282,7 @@ fn run_codex_mode(global: bool, verbose: u8) -> Result<()> {
 
     write_if_changed(&rtk_md_path, RTK_SLIM_CODEX, RTK_MD, verbose)?;
     let added_ref = patch_agents_md(&agents_md_path, &rtk_md_ref, verbose)?;
+    let launcher_path = ensure_codex_rtk_launcher(verbose)?;
 
     println!("\nRTK configured for Codex CLI.\n");
     println!("  RTK.md:    {}", rtk_md_path.display());
@@ -1282,6 +1290,9 @@ fn run_codex_mode(global: bool, verbose: u8) -> Result<()> {
         println!("  AGENTS.md: {} reference added", rtk_md_ref);
     } else {
         println!("  AGENTS.md: {} reference already present", rtk_md_ref);
+    }
+    if let Some(launcher_path) = launcher_path {
+        println!("  Launcher:  {} (PATH shim)", launcher_path.display());
     }
     if global {
         println!(
@@ -1549,6 +1560,96 @@ fn resolve_claude_dir() -> Result<PathBuf> {
 
 fn resolve_codex_dir() -> Result<PathBuf> {
     resolve_home_subdir(".codex")
+}
+
+fn resolve_codex_rtk_launcher_path() -> Result<Option<PathBuf>> {
+    #[cfg(windows)]
+    {
+        let path_entries: Vec<PathBuf> = env::var_os("PATH")
+            .map(|value| env::split_paths(&value).collect())
+            .unwrap_or_default();
+        let cargo_bin = resolve_home_subdir(".cargo/bin").ok();
+        let appdata_npm = env::var_os("APPDATA").map(|value| PathBuf::from(value).join("npm"));
+        let codex_bin = env::var_os("LOCALAPPDATA").map(|value| {
+            PathBuf::from(value)
+                .join("OpenAI")
+                .join("Codex")
+                .join("bin")
+        });
+
+        for candidate in [cargo_bin.clone(), appdata_npm.clone(), codex_bin.clone()]
+            .into_iter()
+            .flatten()
+        {
+            if path_entries.iter().any(|entry| entry == &candidate) {
+                return Ok(Some(candidate.join("rtk.cmd")));
+            }
+        }
+
+        if let Some(candidate) = cargo_bin.or(appdata_npm).or(codex_bin) {
+            return Ok(Some(candidate.join("rtk.cmd")));
+        }
+
+        anyhow::bail!("Cannot determine a launcher directory for Codex RTK")
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(None)
+    }
+}
+
+fn codex_rtk_launcher_contents(target: &Path) -> String {
+    #[cfg(windows)]
+    {
+        format!("@echo off\r\n\"{}\" %*\r\n", target.display())
+    }
+
+    #[cfg(not(windows))]
+    {
+        format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", target.display())
+    }
+}
+
+fn ensure_codex_rtk_launcher(verbose: u8) -> Result<Option<PathBuf>> {
+    let Some(launcher_path) = resolve_codex_rtk_launcher_path()? else {
+        return Ok(None);
+    };
+
+    let target = env::current_exe().context("Failed to resolve current RTK executable path")?;
+    ensure_codex_rtk_launcher_at(&launcher_path, &target, verbose)?;
+    Ok(Some(launcher_path))
+}
+
+fn ensure_codex_rtk_launcher_at(launcher_path: &Path, target: &Path, verbose: u8) -> Result<bool> {
+    if let Some(parent) = launcher_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "Failed to create Codex launcher directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    let content = codex_rtk_launcher_contents(target);
+    write_if_changed(launcher_path, &content, "Codex RTK launcher", verbose)
+}
+
+fn remove_codex_rtk_launcher(launcher_path: &Path, verbose: u8) -> Result<bool> {
+    if !launcher_path.exists() {
+        return Ok(false);
+    }
+
+    fs::remove_file(launcher_path).with_context(|| {
+        format!(
+            "Failed to remove Codex RTK launcher: {}",
+            launcher_path.display()
+        )
+    })?;
+    if verbose > 0 {
+        eprintln!("Removed Codex RTK launcher: {}", launcher_path.display());
+    }
+    Ok(true)
 }
 
 fn resolve_opencode_dir() -> Result<PathBuf> {
@@ -2079,6 +2180,14 @@ fn show_codex_config() -> Result<()> {
         }
     } else {
         println!("[--] Global AGENTS.md: not found");
+    }
+
+    if let Some(launcher_path) = resolve_codex_rtk_launcher_path()? {
+        if launcher_path.exists() {
+            println!("[ok] Codex launcher: {}", launcher_path.display());
+        } else {
+            println!("[--] Codex launcher: not found");
+        }
     }
 
     if local_rtk_md.exists() {
@@ -2719,6 +2828,43 @@ More notes
         let content = fs::read_to_string(&agents_md).unwrap();
         assert!(!content.contains("@RTK.md"));
         assert!(content.contains("# Team rules"));
+    }
+
+    #[test]
+    fn test_ensure_codex_rtk_launcher_at_writes_wrapper() {
+        let temp = TempDir::new().unwrap();
+        let launcher = temp
+            .path()
+            .join(if cfg!(windows) { "rtk.cmd" } else { "rtk" });
+        let target = if cfg!(windows) {
+            PathBuf::from(r"C:\Tools\rtk.exe")
+        } else {
+            PathBuf::from("/usr/local/bin/rtk")
+        };
+
+        let changed = ensure_codex_rtk_launcher_at(&launcher, &target, 0).unwrap();
+
+        assert!(changed);
+        let content = fs::read_to_string(&launcher).unwrap();
+        if cfg!(windows) {
+            assert_eq!(content, "@echo off\r\n\"C:\\Tools\\rtk.exe\" %*\r\n");
+        } else {
+            assert_eq!(content, "#!/bin/sh\nexec \"/usr/local/bin/rtk\" \"$@\"\n");
+        }
+    }
+
+    #[test]
+    fn test_remove_codex_rtk_launcher_deletes_file() {
+        let temp = TempDir::new().unwrap();
+        let launcher = temp
+            .path()
+            .join(if cfg!(windows) { "rtk.cmd" } else { "rtk" });
+        fs::write(&launcher, "echo test").unwrap();
+
+        let removed = remove_codex_rtk_launcher(&launcher, 0).unwrap();
+
+        assert!(removed);
+        assert!(!launcher.exists());
     }
 
     #[test]
