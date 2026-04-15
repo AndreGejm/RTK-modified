@@ -1,6 +1,6 @@
 //! Filters Docker and kubectl output into compact summaries.
 
-use crate::core::runner::{self, RunOptions};
+use crate::core::runner::{self, finish_custom_output, RunOptions};
 use crate::core::tracking;
 use crate::core::utils::{exit_code_from_output, resolved_command};
 use anyhow::{Context, Result};
@@ -50,45 +50,45 @@ where
     )
 }
 
-fn docker_ps(_verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
+struct DockerOutputLabels<'a> {
+    command: &'a str,
+    rtk_command: &'a str,
+    tee: &'a str,
+}
 
-    let raw = resolved_command("docker")
-        .args(["ps"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+fn finish_docker_output(
+    timer: &tracking::TimedExecution,
+    labels: DockerOutputLabels<'_>,
+    stdout: &str,
+    stderr: &str,
+    filtered: &str,
+    source_for_lossiness: &str,
+    exit_code: i32,
+) -> i32 {
+    finish_custom_output(
+        timer,
+        labels.command,
+        labels.rtk_command,
+        "docker",
+        stdout,
+        stderr,
+        filtered,
+        source_for_lossiness,
+        exit_code,
+        RunOptions::with_tee(labels.tee).no_trailing_newline(),
+    )
+}
 
-    let output = resolved_command("docker")
-        .args([
-            "ps",
-            "--format",
-            "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
-        ])
-        .output()
-        .context("Failed to run docker ps")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
-        timer.track("docker ps", "rtk docker ps", &raw, &raw);
-        return Ok(exit_code_from_output(&output, "docker"));
+fn format_docker_ps(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return "[docker] 0 containers".to_string();
     }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut rtk = String::new();
+    let count = raw.lines().count();
+    let mut rtk = format!("[docker] {} containers:\n", count);
 
-    if stdout.trim().is_empty() {
-        rtk.push_str("[docker] 0 containers");
-        println!("{}", rtk);
-        timer.track("docker ps", "rtk docker ps", &raw, &rtk);
-        return Ok(0);
-    }
-
-    let count = stdout.lines().count();
-    rtk.push_str(&format!("[docker] {} containers:\n", count));
-
-    for line in stdout.lines().take(15) {
+    for line in raw.lines().take(15) {
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 4 {
             let id = &parts[0][..12.min(parts[0].len())];
@@ -110,45 +110,20 @@ fn docker_ps(_verbose: u8) -> Result<i32> {
             }
         }
     }
+
     if count > 15 {
         rtk.push_str(&format!("  ... +{} more", count - 15));
+    } else {
+        rtk.truncate(rtk.trim_end_matches('\n').len());
     }
 
-    print!("{}", rtk);
-    timer.track("docker ps", "rtk docker ps", &raw, &rtk);
-    Ok(0)
+    rtk
 }
 
-fn docker_images(_verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
-
-    let raw = resolved_command("docker")
-        .args(["images"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-
-    let output = resolved_command("docker")
-        .args(["images", "--format", "{{.Repository}}:{{.Tag}}\t{{.Size}}"])
-        .output()
-        .context("Failed to run docker images")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
-        timer.track("docker images", "rtk docker images", &raw, &raw);
-        return Ok(exit_code_from_output(&output, "docker"));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let lines: Vec<&str> = stdout.lines().collect();
-    let mut rtk = String::new();
-
+fn format_docker_images(raw: &str) -> String {
+    let lines: Vec<&str> = raw.lines().collect();
     if lines.is_empty() {
-        rtk.push_str("[docker] 0 images");
-        println!("{}", rtk);
-        timer.track("docker images", "rtk docker images", &raw, &rtk);
-        return Ok(0);
+        return "[docker] 0 images".to_string();
     }
 
     let mut total_size_mb: f64 = 0.0;
@@ -172,11 +147,7 @@ fn docker_images(_verbose: u8) -> Result<i32> {
     } else {
         format!("{:.0}MB", total_size_mb)
     };
-    rtk.push_str(&format!(
-        "[docker] {} images ({})\n",
-        lines.len(),
-        total_display
-    ));
+    let mut rtk = format!("[docker] {} images ({})\n", lines.len(), total_display);
 
     for line in lines.iter().take(15) {
         let parts: Vec<&str> = line.split('\t').collect();
@@ -191,13 +162,152 @@ fn docker_images(_verbose: u8) -> Result<i32> {
             rtk.push_str(&format!("  {} [{}]\n", short, size));
         }
     }
+
     if lines.len() > 15 {
         rtk.push_str(&format!("  ... +{} more", lines.len() - 15));
+    } else {
+        rtk.truncate(rtk.trim_end_matches('\n').len());
     }
 
-    print!("{}", rtk);
-    timer.track("docker images", "rtk docker images", &raw, &rtk);
-    Ok(0)
+    rtk
+}
+
+fn docker_ps(_verbose: u8) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
+    let raw_output = resolved_command("docker")
+        .args(["ps"])
+        .output()
+        .context("Failed to run docker ps")?;
+    let raw_stdout = String::from_utf8_lossy(&raw_output.stdout);
+    let raw_stderr = String::from_utf8_lossy(&raw_output.stderr);
+    let raw_exit = exit_code_from_output(&raw_output, "docker");
+
+    if raw_exit != 0 {
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker ps",
+                rtk_command: "rtk docker ps",
+                tee: "docker_ps",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
+    }
+
+    let output = resolved_command("docker")
+        .args([
+            "ps",
+            "--format",
+            "{{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
+        ])
+        .output()
+        .context("Failed to run docker ps")?;
+
+    let structured_exit = exit_code_from_output(&output, "docker");
+    if structured_exit != 0 {
+        eprintln!("[rtk] docker ps --format failed; falling back to raw docker ps");
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker ps",
+                rtk_command: "rtk docker ps",
+                tee: "docker_ps",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let filtered = format_docker_ps(&stdout);
+
+    Ok(finish_docker_output(
+        &timer,
+        DockerOutputLabels {
+            command: "docker ps",
+            rtk_command: "rtk docker ps",
+            tee: "docker_ps",
+        },
+        raw_stdout.as_ref(),
+        raw_stderr.as_ref(),
+        &filtered,
+        stdout.as_ref(),
+        raw_exit,
+    ))
+}
+
+fn docker_images(_verbose: u8) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
+    let raw_output = resolved_command("docker")
+        .args(["images"])
+        .output()
+        .context("Failed to run docker images")?;
+    let raw_stdout = String::from_utf8_lossy(&raw_output.stdout);
+    let raw_stderr = String::from_utf8_lossy(&raw_output.stderr);
+    let raw_exit = exit_code_from_output(&raw_output, "docker");
+
+    if raw_exit != 0 {
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker images",
+                rtk_command: "rtk docker images",
+                tee: "docker_images",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
+    }
+
+    let output = resolved_command("docker")
+        .args(["images", "--format", "{{.Repository}}:{{.Tag}}\t{{.Size}}"])
+        .output()
+        .context("Failed to run docker images")?;
+
+    let structured_exit = exit_code_from_output(&output, "docker");
+    if structured_exit != 0 {
+        eprintln!("[rtk] docker images --format failed; falling back to raw docker images");
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker images",
+                rtk_command: "rtk docker images",
+                tee: "docker_images",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let filtered = format_docker_images(&stdout);
+
+    Ok(finish_docker_output(
+        &timer,
+        DockerOutputLabels {
+            command: "docker images",
+            rtk_command: "rtk docker images",
+            tee: "docker_images",
+        },
+        raw_stdout.as_ref(),
+        raw_stderr.as_ref(),
+        &filtered,
+        stdout.as_ref(),
+        raw_exit,
+    ))
 }
 
 fn docker_logs(args: &[String], _verbose: u8) -> Result<i32> {
@@ -536,13 +646,25 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
         .args(["compose", "ps"])
         .output()
         .context("Failed to run docker compose ps")?;
+    let raw_stdout = String::from_utf8_lossy(&raw_output.stdout);
+    let raw_stderr = String::from_utf8_lossy(&raw_output.stderr);
+    let raw_exit = exit_code_from_output(&raw_output, "docker");
 
-    if !raw_output.status.success() {
-        let stderr = String::from_utf8_lossy(&raw_output.stderr);
-        eprintln!("{}", stderr);
-        return Ok(exit_code_from_output(&raw_output, "docker"));
+    if raw_exit != 0 {
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker compose ps",
+                rtk_command: "rtk docker compose ps",
+                tee: "docker_compose_ps",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
     }
-    let raw = String::from_utf8_lossy(&raw_output.stdout).to_string();
 
     // Structured output for parsing (same pattern as docker_ps)
     let output = resolved_command("docker")
@@ -555,21 +677,43 @@ pub fn run_compose_ps(verbose: u8) -> Result<i32> {
         .output()
         .context("Failed to run docker compose ps --format")?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("{}", stderr);
-        return Ok(exit_code_from_output(&output, "docker"));
+    let structured_exit = exit_code_from_output(&output, "docker");
+    if structured_exit != 0 {
+        eprintln!("[rtk] docker compose ps --format failed; falling back to raw docker compose ps");
+        return Ok(finish_docker_output(
+            &timer,
+            DockerOutputLabels {
+                command: "docker compose ps",
+                rtk_command: "rtk docker compose ps",
+                tee: "docker_compose_ps",
+            },
+            raw_stdout.as_ref(),
+            raw_stderr.as_ref(),
+            raw_stdout.as_ref(),
+            raw_stdout.as_ref(),
+            raw_exit,
+        ));
     }
-    let structured = String::from_utf8_lossy(&output.stdout).to_string();
+    let structured = String::from_utf8_lossy(&output.stdout);
 
     if verbose > 0 {
-        eprintln!("raw docker compose ps:\n{}", raw);
+        eprintln!("raw docker compose ps:\n{}", raw_stdout);
     }
 
-    let rtk = format_compose_ps(&structured);
-    println!("{}", rtk);
-    timer.track("docker compose ps", "rtk docker compose ps", &raw, &rtk);
-    Ok(0)
+    let filtered = format_compose_ps(&structured);
+    Ok(finish_docker_output(
+        &timer,
+        DockerOutputLabels {
+            command: "docker compose ps",
+            rtk_command: "rtk docker compose ps",
+            tee: "docker_compose_ps",
+        },
+        raw_stdout.as_ref(),
+        raw_stderr.as_ref(),
+        &filtered,
+        structured.as_ref(),
+        raw_exit,
+    ))
 }
 
 pub fn run_compose_logs(service: Option<&str>, verbose: u8) -> Result<i32> {
@@ -629,6 +773,26 @@ pub fn run_kubectl_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_format_docker_ps_basic() {
+        let raw = "1234567890abcdef\tweb\tUp 2 hours\tghcr.io/example/web:latest\t0.0.0.0:80->80/tcp\n\
+                   fedcba0987654321\tapi\tUp 1 hour\texample/api:1.2.3\t";
+        let out = format_docker_ps(raw);
+        assert!(out.starts_with("[docker] 2 containers:"));
+        assert!(out.contains("1234567890ab web (web:latest) [80]"));
+        assert!(out.contains("fedcba098765 api (api:1.2.3)"));
+    }
+
+    #[test]
+    fn test_format_docker_images_basic() {
+        let raw = "ghcr.io/example/web:latest\t1.5GB\n\
+                   example/api:1.2.3\t512MB";
+        let out = format_docker_images(raw);
+        assert!(out.starts_with("[docker] 2 images (2.0GB)"));
+        assert!(out.contains("web:latest [1.5GB]"));
+        assert!(out.contains("example/api:1.2.3 [512MB]"));
+    }
 
     // ── format_compose_ps ──────────────────────────────────
 

@@ -34,6 +34,36 @@ fn git_cmd(global_args: &[String]) -> Command {
     cmd
 }
 
+fn print_captured_output(output: &std::process::Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+        if !stdout.ends_with('\n') {
+            println!();
+        }
+    }
+
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+}
+
+fn has_compact_flag(args: &[String]) -> bool {
+    args.iter().any(|arg| arg == "--compact")
+}
+
+fn strip_rtk_git_flags(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--compact" && arg.as_str() != "--no-compact")
+        .cloned()
+        .collect()
+}
+
 pub fn run(
     cmd: GitCommand,
     args: &[String],
@@ -104,55 +134,46 @@ fn run_diff(
     global_args: &[String],
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215).
+    let git_args = normalize_diff_args(&strip_rtk_git_flags(args));
+    let args_display = git_args.join(" ");
 
-    // Re-insert `--` when clap's trailing_var_arg consumed it (issue #1215)
-    let args = &normalize_diff_args(args);
-
-    // Check if user wants stat output
-    let wants_stat = args
+    let wants_stat = git_args
         .iter()
         .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
 
-    // Check if user wants compact diff (default RTK behavior)
-    let wants_compact = !args.iter().any(|arg| arg == "--no-compact");
+    // Diff output is raw by default; compact mode is opt-in.
+    let wants_compact = has_compact_flag(args);
 
     if wants_stat || !wants_compact {
-        // User wants stat or explicitly no compacting - pass through directly
         let mut cmd = git_cmd(global_args);
         cmd.arg("diff");
-        for arg in args {
-            if arg == "--no-compact" {
-                continue; // RTK flag, not a git flag
-            }
+        for arg in &git_args {
             cmd.arg(arg);
         }
 
         let output = cmd.output().context("Failed to run git diff")?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("{}", stderr);
-            return Ok(exit_code_from_output(&output, "git"));
-        }
-
         let stdout = String::from_utf8_lossy(&output.stdout);
-        println!("{}", stdout.trim());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let raw = format!("{}{}", stdout, stderr);
+
+        print_captured_output(&output);
 
         timer.track(
-            &format!("git diff {}", args.join(" ")),
-            &format!("rtk git diff {} (passthrough)", args.join(" ")),
-            &stdout,
-            &stdout,
+            &format!("git diff {}", args_display),
+            &format!("rtk git diff {} (passthrough)", args_display),
+            &raw,
+            &raw,
         );
 
-        return Ok(0);
+        return Ok(exit_code_from_output(&output, "git"));
     }
 
-    // Default RTK behavior: stat first, then compacted diff
+    // Explicit compact mode: stat first, then compacted diff.
     let mut cmd = git_cmd(global_args);
     cmd.arg("diff").arg("--stat");
 
-    for arg in args {
+    for arg in &git_args {
         cmd.arg(arg);
     }
 
@@ -161,13 +182,11 @@ fn run_diff(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
-        }
-        let raw = stat_stdout.to_string();
+        let raw = format!("{}{}", stat_stdout, stderr);
+        print_captured_output(&output);
         timer.track(
-            &format!("git diff {}", args.join(" ")),
-            &format!("rtk git diff {}", args.join(" ")),
+            &format!("git diff {}", args_display),
+            &format!("rtk git diff {}", args_display),
             &raw,
             &raw,
         );
@@ -178,13 +197,11 @@ fn run_diff(
         eprintln!("Git diff summary:");
     }
 
-    // Print stat summary first
     println!("{}", stat_stdout.trim());
 
-    // Now get actual diff but compact it
     let mut diff_cmd = git_cmd(global_args);
     diff_cmd.arg("diff");
-    for arg in args {
+    for arg in &git_args {
         diff_cmd.arg(arg);
     }
 
@@ -201,8 +218,8 @@ fn run_diff(
     }
 
     timer.track(
-        &format!("git diff {}", args.join(" ")),
-        &format!("rtk git diff {}", args.join(" ")),
+        &format!("git diff {}", args_display),
+        &format!("rtk git diff {}", args_display),
         &format!("{}\n{}", stat_stdout, diff_stdout),
         &final_output,
     );
@@ -217,53 +234,46 @@ fn run_show(
     global_args: &[String],
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    let git_args = strip_rtk_git_flags(args);
+    let args_display = git_args.join(" ");
+    let wants_compact = has_compact_flag(args);
 
-    // If user wants --stat or --format only, pass through
-    let wants_stat_only = args
+    let wants_stat_only = git_args
         .iter()
         .any(|arg| arg == "--stat" || arg == "--numstat" || arg == "--shortstat");
 
-    let wants_format = args
+    let wants_format = git_args
         .iter()
         .any(|arg| arg.starts_with("--pretty") || arg.starts_with("--format"));
 
-    // `git show rev:path` prints a blob, not a commit diff. In this mode we should
-    // pass through directly to avoid duplicated output from compact-show steps.
-    let wants_blob_show = args.iter().any(|arg| is_blob_show_arg(arg));
+    let wants_blob_show = git_args.iter().any(|arg| is_blob_show_arg(arg));
 
-    if wants_stat_only || wants_format || wants_blob_show {
+    if wants_stat_only || wants_format || wants_blob_show || !wants_compact {
         let mut cmd = git_cmd(global_args);
         cmd.arg("show");
-        for arg in args {
+        for arg in &git_args {
             cmd.arg(arg);
         }
         let output = cmd.output().context("Failed to run git show")?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            eprintln!("{}", stderr);
-            return Ok(exit_code_from_output(&output, "git"));
-        }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        if wants_blob_show {
-            print!("{}", stdout);
-        } else {
-            println!("{}", stdout.trim());
-        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let raw = format!("{}{}", stdout, stderr);
+
+        print_captured_output(&output);
 
         timer.track(
-            &format!("git show {}", args.join(" ")),
-            &format!("rtk git show {} (passthrough)", args.join(" ")),
-            &stdout,
-            &stdout,
+            &format!("git show {}", args_display),
+            &format!("rtk git show {} (passthrough)", args_display),
+            &raw,
+            &raw,
         );
 
-        return Ok(0);
+        return Ok(exit_code_from_output(&output, "git"));
     }
 
-    // Get raw output for tracking
     let mut raw_cmd = git_cmd(global_args);
     raw_cmd.arg("show");
-    for arg in args {
+    for arg in &git_args {
         raw_cmd.arg(arg);
     }
     let raw_output = raw_cmd
@@ -271,25 +281,22 @@ fn run_show(
         .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
         .unwrap_or_default();
 
-    // Step 1: one-line commit summary
     let mut summary_cmd = git_cmd(global_args);
     summary_cmd.args(["show", "--no-patch", "--pretty=format:%h %s (%ar) <%an>"]);
-    for arg in args {
+    for arg in &git_args {
         summary_cmd.arg(arg);
     }
     let summary_output = summary_cmd.output().context("Failed to run git show")?;
     if !summary_output.status.success() {
-        let stderr = String::from_utf8_lossy(&summary_output.stderr);
-        eprintln!("{}", stderr);
+        print_captured_output(&summary_output);
         return Ok(exit_code_from_output(&summary_output, "git"));
     }
     let summary = String::from_utf8_lossy(&summary_output.stdout);
     println!("{}", summary.trim());
 
-    // Step 2: --stat summary
     let mut stat_cmd = git_cmd(global_args);
     stat_cmd.args(["show", "--stat", "--pretty=format:"]);
-    for arg in args {
+    for arg in &git_args {
         stat_cmd.arg(arg);
     }
     let stat_output = stat_cmd.output().context("Failed to run git show --stat")?;
@@ -299,10 +306,9 @@ fn run_show(
         println!("{}", stat_text);
     }
 
-    // Step 3: compacted diff
     let mut diff_cmd = git_cmd(global_args);
     diff_cmd.args(["show", "--pretty=format:"]);
-    for arg in args {
+    for arg in &git_args {
         diff_cmd.arg(arg);
     }
     let diff_output = diff_cmd.output().context("Failed to run git show (diff)")?;
@@ -320,8 +326,8 @@ fn run_show(
     }
 
     timer.track(
-        &format!("git show {}", args.join(" ")),
-        &format!("rtk git show {}", args.join(" ")),
+        &format!("git show {}", args_display),
+        &format!("rtk git show {}", args_display),
         &raw_output,
         &final_output,
     );
@@ -431,62 +437,76 @@ fn run_log(
     global_args: &[String],
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    let git_args = strip_rtk_git_flags(args);
+    let args_display = git_args.join(" ");
+
+    if !has_compact_flag(args) {
+        let mut cmd = git_cmd(global_args);
+        cmd.arg("log");
+        for arg in &git_args {
+            cmd.arg(arg);
+        }
+
+        let output = cmd.output().context("Failed to run git log")?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let raw = format!("{}{}", stdout, stderr);
+
+        print_captured_output(&output);
+
+        timer.track(
+            &format!("git log {}", args_display),
+            &format!("rtk git log {} (passthrough)", args_display),
+            &raw,
+            &raw,
+        );
+
+        return Ok(exit_code_from_output(&output, "git"));
+    }
 
     let mut cmd = git_cmd(global_args);
     cmd.arg("log");
 
-    // Check if user provided format flags
-    let has_format_flag = args.iter().any(|arg| {
+    let has_format_flag = git_args.iter().any(|arg| {
         arg.starts_with("--oneline") || arg.starts_with("--pretty") || arg.starts_with("--format")
     });
 
-    // Check if user provided limit flag (-N, -n N, --max-count=N, --max-count N)
-    let has_limit_flag = args.iter().any(|arg| {
+    let has_limit_flag = git_args.iter().any(|arg| {
         (arg.starts_with('-') && arg.chars().nth(1).is_some_and(|c| c.is_ascii_digit()))
             || arg == "-n"
             || arg.starts_with("--max-count")
     });
 
-    // Apply RTK defaults only if user didn't specify them
-    // Use %b (body) to preserve first line of commit body for agent context
-    // (BREAKING CHANGE, Closes #xxx, design notes)
     if !has_format_flag {
         cmd.args(["--pretty=format:%h %s (%ar) <%an>%n%b%n---END---"]);
     }
 
-    // Determine limit: respect user's explicit -N flag, use sensible defaults otherwise
     let (limit, user_set_limit) = if has_limit_flag {
-        // User explicitly passed -N / -n N / --max-count=N → respect their choice
-        let n = parse_user_limit(args).unwrap_or(10);
+        let n = parse_user_limit(&git_args).unwrap_or(10);
         (n, true)
     } else if has_format_flag {
-        // --oneline / --pretty without -N: user wants compact output, allow more
         cmd.arg("-50");
         (50, false)
     } else {
-        // No flags at all: default to 10
         cmd.arg("-10");
         (10, false)
     };
 
-    // Only add --no-merges if user didn't explicitly request merge commits
-    let wants_merges = args
+    let wants_merges = git_args
         .iter()
         .any(|arg| arg == "--merges" || arg == "--min-parents=2");
     if !wants_merges {
         cmd.arg("--no-merges");
     }
 
-    // Pass all user arguments
-    for arg in args {
+    for arg in &git_args {
         cmd.arg(arg);
     }
 
     let output = cmd.output().context("Failed to run git log")?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("{}", stderr);
+        print_captured_output(&output);
         return Ok(exit_code_from_output(&output, "git"));
     }
 
@@ -496,13 +516,12 @@ fn run_log(
         eprintln!("Git log output:");
     }
 
-    // Post-process: truncate long messages, cap lines only if RTK set the default
     let filtered = filter_log_output(&stdout, limit, user_set_limit, has_format_flag);
     println!("{}", filtered);
 
     timer.track(
-        &format!("git log {}", args.join(" ")),
-        &format!("rtk git log {}", args.join(" ")),
+        &format!("git log {}", args_display),
+        &format!("rtk git log {}", args_display),
         &stdout,
         &filtered,
     );
@@ -2456,6 +2475,22 @@ no changes added to commit (use "git add" and/or "git commit -a")
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_has_compact_flag() {
+        assert!(has_compact_flag(&["--compact".to_string()]));
+        assert!(!has_compact_flag(&["--stat".to_string()]));
+    }
+
+    #[test]
+    fn test_strip_rtk_git_flags() {
+        let args = vec![
+            "--compact".to_string(),
+            "--stat".to_string(),
+            "--no-compact".to_string(),
+        ];
+        assert_eq!(strip_rtk_git_flags(&args), vec!["--stat".to_string()]);
     }
 
     // --- truncation accuracy ---

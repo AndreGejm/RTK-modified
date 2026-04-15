@@ -154,9 +154,9 @@ fn run_filtered(original_args: &[String], invocation: &RunInvocation, verbose: u
         crate::core::runner::RunOptions::stdout_only(),
     )?;
 
-    // golangci-lint: exit 0 = clean, exit 1 = lint issues found (not an error),
-    // exit 2+ = config/build error, None = killed by signal (OOM, SIGKILL)
-    Ok(if exit_code == 1 { 0 } else { exit_code })
+    // Preserve the real exit code so callers can distinguish clean runs from lint findings
+    // and configuration/runtime failures.
+    Ok(exit_code)
 }
 
 fn run_passthrough(args: &[String], verbose: u8) -> Result<i32> {

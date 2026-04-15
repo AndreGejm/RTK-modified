@@ -2,7 +2,7 @@
 
 use crate::core::config;
 use crate::core::tracking;
-use crate::core::utils::{package_manager_exec, resolved_command, truncate};
+use crate::core::utils::{exit_code_from_output, package_manager_exec, resolved_command, truncate};
 use crate::mypy_cmd;
 use crate::ruff_cmd;
 use anyhow::{Context, Result};
@@ -204,28 +204,51 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         _ => filter_generic_lint(&raw),
     };
 
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(if output.status.success() { 0 } else { 1 });
-    if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "lint", exit_code) {
-        println!("{}\n{}", filtered, hint);
+    let exit_code = exit_code_from_output(&output, linter);
+    if exit_code != 0 {
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+            if !stdout.ends_with('\n') {
+                println!();
+            }
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+            if !stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+        if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "lint")
+            .or_else(|| crate::core::tee::tee_and_hint(&raw, "lint", exit_code))
+        {
+            println!("{}", hint);
+        }
+
+        timer.track(
+            &format!("{} {}", linter, args.join(" ")),
+            &format!("rtk lint {} {}", linter, args.join(" ")),
+            &raw,
+            &raw,
+        );
+
+        return Ok(exit_code);
+    }
+
+    let display = format!("[summary view]\n{}", filtered);
+    if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "lint") {
+        println!("{}\n{}", display, hint);
     } else {
-        println!("{}", filtered);
+        println!("{}", display);
     }
 
     timer.track(
         &format!("{} {}", linter, args.join(" ")),
         &format!("rtk lint {} {}", linter, args.join(" ")),
         &raw,
-        &filtered,
+        &display,
     );
 
-    if !output.status.success() {
-        return Ok(crate::core::utils::exit_code_from_output(&output, "eslint"));
-    }
-
-    Ok(0)
+    Ok(exit_code)
 }
 
 /// Filter ESLint JSON output - group by rule and file

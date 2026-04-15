@@ -1,7 +1,10 @@
 //! Filters pnpm output — dependency trees, install logs, outdated packages.
 
-use crate::core::tracking;
-use crate::core::utils::resolved_command;
+use crate::core::{
+    runner::{finish_custom_output, RunOptions},
+    tracking,
+};
+use crate::core::utils::{exit_code_from_output, resolved_command};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -313,14 +316,9 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let output = cmd.output().context("Failed to run pnpm list")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprint!("{}", stderr);
-        return Ok(crate::core::utils::exit_code_from_output(&output, "pnpm"));
-    }
-
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = exit_code_from_output(&output, "pnpm");
 
     // Parse output using PnpmListParser
     let parse_result = PnpmListParser::parse(&stdout);
@@ -345,16 +343,18 @@ fn run_list(depth: usize, args: &[String], verbose: u8) -> Result<i32> {
         }
     };
 
-    println!("{}", filtered);
-
-    timer.track(
+    Ok(finish_custom_output(
+        &timer,
         &format!("pnpm list --depth={}", depth),
         &format!("rtk pnpm list --depth={}", depth),
-        &stdout,
+        "pnpm",
+        stdout.as_ref(),
+        stderr.as_ref(),
         &filtered,
-    );
-
-    Ok(0)
+        stdout.as_ref(),
+        exit_code,
+        RunOptions::with_tee("pnpm_list"),
+    ))
 }
 
 fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
@@ -372,7 +372,7 @@ fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
     let output = cmd.output().context("Failed to run pnpm outdated")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let combined = format!("{}{}", stdout, stderr);
+    let exit_code = exit_code_from_output(&output, "pnpm");
 
     // Parse output using PnpmOutdatedParser
     let parse_result = PnpmOutdatedParser::parse(&stdout);
@@ -397,15 +397,24 @@ fn run_outdated(args: &[String], verbose: u8) -> Result<i32> {
         }
     };
 
-    if filtered.trim().is_empty() {
-        println!("All packages up-to-date");
+    let display = if filtered.trim().is_empty() {
+        "All packages up-to-date".to_string()
     } else {
-        println!("{}", filtered);
-    }
+        filtered
+    };
 
-    timer.track("pnpm outdated", "rtk pnpm outdated", &combined, &filtered);
-
-    Ok(0)
+    Ok(finish_custom_output(
+        &timer,
+        "pnpm outdated",
+        "rtk pnpm outdated",
+        "pnpm",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &display,
+        stdout.as_ref(),
+        exit_code,
+        RunOptions::with_tee("pnpm_outdated"),
+    ))
 }
 
 fn run_install(packages: &[String], args: &[String], verbose: u8) -> Result<i32> {
@@ -439,25 +448,22 @@ fn run_install(packages: &[String], args: &[String], verbose: u8) -> Result<i32>
     let output = cmd.output().context("Failed to run pnpm install")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-
-    if !output.status.success() {
-        eprint!("{}", stderr);
-        return Ok(crate::core::utils::exit_code_from_output(&output, "pnpm"));
-    }
-
     let combined = format!("{}{}", stdout, stderr);
     let filtered = filter_pnpm_install(&combined);
+    let exit_code = exit_code_from_output(&output, "pnpm");
 
-    println!("{}", filtered);
-
-    timer.track(
+    Ok(finish_custom_output(
+        &timer,
         &format!("pnpm install {}", packages.join(" ")),
         &format!("rtk pnpm install {}", packages.join(" ")),
-        &combined,
+        "pnpm",
+        stdout.as_ref(),
+        stderr.as_ref(),
         &filtered,
-    );
-
-    Ok(0)
+        &combined,
+        exit_code,
+        RunOptions::with_tee("pnpm_install"),
+    ))
 }
 
 /// Filter pnpm install output - remove progress bars, keep summary

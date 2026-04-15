@@ -1,5 +1,6 @@
 //! Matches shell commands against known RTK rewrite rules to decide how to handle them.
 
+use crate::core::policy::allows_automatic_rewrite;
 use lazy_static::lazy_static;
 use regex::{Regex, RegexSet};
 
@@ -644,6 +645,11 @@ fn rewrite_segment(seg: &str, excluded: &[String]) -> Option<String> {
     let env_prefix_len = cmd_part.len() - stripped_cow.len();
     let env_prefix = &cmd_part[..env_prefix_len];
     let cmd_clean = stripped_cow.trim();
+    let normalized_for_policy = strip_git_global_opts(&strip_absolute_path(cmd_clean));
+
+    if !allows_automatic_rewrite(rule.rtk_cmd, normalized_for_policy.as_str()) {
+        return None;
+    }
 
     // #345: RTK_DISABLED=1 in env prefix → skip rewrite entirely
     // #508: warn on stderr so agents learn to stop overusing it
@@ -755,10 +761,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_yadm_status() {
-        assert_eq!(
-            rewrite_command("yadm status", &[]),
-            Some("rtk git status".to_string())
-        );
+        assert_eq!(rewrite_command("yadm status", &[]), None);
     }
 
     #[test]
@@ -1057,10 +1060,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_git_status() {
-        assert_eq!(
-            rewrite_command("git status", &[]),
-            Some("rtk git status".into())
-        );
+        assert_eq!(rewrite_command("git status", &[]), None);
     }
 
     #[test]
@@ -1075,10 +1075,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_git_dash_c_status() {
-        assert_eq!(
-            rewrite_command("git -C /path/to/repo status", &[]),
-            Some("rtk git -C /path/to/repo status".into())
-        );
+        assert_eq!(rewrite_command("git -C /path/to/repo status", &[]), None);
     }
 
     #[test]
@@ -1124,8 +1121,8 @@ mod tests {
     #[test]
     fn test_rewrite_compound_and() {
         assert_eq!(
-            rewrite_command("git add . && cargo test", &[]),
-            Some("rtk git add . && rtk cargo test".into())
+            rewrite_command("git log -10 && cargo test", &[]),
+            Some("rtk git log -10 && rtk cargo test".into())
         );
     }
 
@@ -1133,10 +1130,13 @@ mod tests {
     fn test_rewrite_compound_three_segments() {
         assert_eq!(
             rewrite_command(
-                "cargo fmt --all && cargo clippy --all-targets && cargo test",
+                "cargo check --all-targets && cargo clippy --all-targets && cargo test",
                 &[]
             ),
-            Some("rtk cargo fmt --all && rtk cargo clippy --all-targets && rtk cargo test".into())
+            Some(
+                "rtk cargo check --all-targets && rtk cargo clippy --all-targets && rtk cargo test"
+                    .into()
+            )
         );
     }
 
@@ -1151,8 +1151,8 @@ mod tests {
     #[test]
     fn test_rewrite_background_single_amp() {
         assert_eq!(
-            rewrite_command("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            rewrite_command("cargo test & git log -10", &[]),
+            Some("rtk cargo test & rtk git log -10".into())
         );
     }
 
@@ -1168,8 +1168,8 @@ mod tests {
     fn test_rewrite_background_does_not_affect_double_amp() {
         // `&&` must still work after adding `&` support
         assert_eq!(
-            rewrite_command("cargo test && git status", &[]),
-            Some("rtk cargo test && rtk git status".into())
+            rewrite_command("cargo test && git log -10", &[]),
+            Some("rtk cargo test && rtk git log -10".into())
         );
     }
 
@@ -1186,8 +1186,8 @@ mod tests {
     #[test]
     fn test_rewrite_with_env_prefix() {
         assert_eq!(
-            rewrite_command("GIT_SSH_COMMAND=ssh git push", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push".into())
+            rewrite_command("GIT_SSH_COMMAND=ssh git log -10", &[]),
+            Some("GIT_SSH_COMMAND=ssh rtk git log -10".into())
         );
     }
 
@@ -1285,11 +1285,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_find_no_pipe_still_rewritten() {
-        // find WITHOUT a pipe should still be rewritten
-        assert_eq!(
-            rewrite_command("find . -name '*.rs'", &[]),
-            Some("rtk find . -name '*.rs'".into())
-        );
+        assert_eq!(rewrite_command("find . -name '*.rs'", &[]), None);
     }
 
     #[test]
@@ -1382,8 +1378,8 @@ mod tests {
     #[test]
     fn test_rewrite_non_rtk_disabled_env_still_rewrites() {
         assert_eq!(
-            rewrite_command("SOME_VAR=1 git status", &[]),
-            Some("SOME_VAR=1 rtk git status".into())
+            rewrite_command("SOME_VAR=1 git log -10", &[]),
+            Some("SOME_VAR=1 rtk git log -10".into())
         );
     }
 
@@ -1391,34 +1387,34 @@ mod tests {
     fn test_rewrite_env_quoted_value_with_spaces() {
         assert_eq!(
             rewrite_command(
-                r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git push"#,
+                r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" git log -10"#,
                 &[]
             ),
-            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" rtk git push"#.into())
+            Some(r#"GIT_SSH_COMMAND="ssh -o StrictHostKeyChecking=no" rtk git log -10"#.into())
         );
     }
 
     #[test]
     fn test_rewrite_env_single_quoted_value_with_spaces() {
         assert_eq!(
-            rewrite_command("EDITOR='vim -u NONE' git commit", &[]),
-            Some("EDITOR='vim -u NONE' rtk git commit".into())
+            rewrite_command("EDITOR='vim -u NONE' git log -10", &[]),
+            Some("EDITOR='vim -u NONE' rtk git log -10".into())
         );
     }
 
     #[test]
     fn test_rewrite_env_quoted_plus_unquoted() {
         assert_eq!(
-            rewrite_command(r#"FOO="bar baz" BAR=1 git status"#, &[]),
-            Some(r#"FOO="bar baz" BAR=1 rtk git status"#.into())
+            rewrite_command(r#"FOO="bar baz" BAR=1 git log -10"#, &[]),
+            Some(r#"FOO="bar baz" BAR=1 rtk git log -10"#.into())
         );
     }
 
     #[test]
     fn test_rewrite_env_escaped_quotes_in_value() {
         assert_eq!(
-            rewrite_command(r#"FOO="he said \"hello\"" git status"#, &[]),
-            Some(r#"FOO="he said \"hello\"" rtk git status"#.into())
+            rewrite_command(r#"FOO="he said \"hello\"" git log -10"#, &[]),
+            Some(r#"FOO="he said \"hello\"" rtk git log -10"#.into())
         );
     }
 
@@ -1457,8 +1453,8 @@ mod tests {
     fn test_rewrite_redirect_plain_2_devnull() {
         // 2>/dev/null has no `&`, never broken — non-regression
         assert_eq!(
-            rewrite_command("git status 2>/dev/null", &[]),
-            Some("rtk git status 2>/dev/null".into())
+            rewrite_command("git log -10 2>/dev/null", &[]),
+            Some("rtk git log -10 2>/dev/null".into())
         );
     }
 
@@ -1482,8 +1478,8 @@ mod tests {
     fn test_rewrite_redirect_double() {
         // Double redirect: only last one stripped, but full command rewrites correctly
         assert_eq!(
-            rewrite_command("git status 2>&1 >/dev/null", &[]),
-            Some("rtk git status 2>&1 >/dev/null".into())
+            rewrite_command("git log -10 2>&1 >/dev/null", &[]),
+            Some("rtk git log -10 2>&1 >/dev/null".into())
         );
     }
 
@@ -1491,8 +1487,8 @@ mod tests {
     fn test_rewrite_redirect_fd_close() {
         // 2>&- (close stderr fd)
         assert_eq!(
-            rewrite_command("git status 2>&-", &[]),
-            Some("rtk git status 2>&-".into())
+            rewrite_command("git log -10 2>&-", &[]),
+            Some("rtk git log -10 2>&-".into())
         );
     }
 
@@ -1500,7 +1496,7 @@ mod tests {
     fn test_rewrite_redirect_quotes_not_stripped() {
         // Redirect-like chars inside quotes should NOT be stripped
         // Known limitation: apostrophes cause conservative no-strip (safe fallback)
-        let result = rewrite_command("git commit -m \"it's fixed\" 2>&1", &[]);
+        let result = rewrite_command("git log --grep \"it's fixed\" 2>&1", &[]);
         assert!(
             result.is_some(),
             "Should still rewrite even with apostrophe"
@@ -1511,8 +1507,8 @@ mod tests {
     fn test_rewrite_background_amp_non_regression() {
         // background `&` must still work after redirect fix
         assert_eq!(
-            rewrite_command("cargo test & git status", &[]),
-            Some("rtk cargo test & rtk git status".into())
+            rewrite_command("cargo test & git log -10", &[]),
+            Some("rtk cargo test & rtk git log -10".into())
         );
     }
 
@@ -1703,42 +1699,27 @@ mod tests {
 
     #[test]
     fn test_rewrite_diff() {
-        assert_eq!(
-            rewrite_command("diff file1.txt file2.txt", &[]),
-            Some("rtk diff file1.txt file2.txt".into())
-        );
+        assert_eq!(rewrite_command("diff file1.txt file2.txt", &[]), None);
     }
 
     #[test]
     fn test_rewrite_gh_release() {
-        assert_eq!(
-            rewrite_command("gh release list", &[]),
-            Some("rtk gh release list".into())
-        );
+        assert_eq!(rewrite_command("gh release list", &[]), None);
     }
 
     #[test]
     fn test_rewrite_cargo_install() {
-        assert_eq!(
-            rewrite_command("cargo install rtk", &[]),
-            Some("rtk cargo install rtk".into())
-        );
+        assert_eq!(rewrite_command("cargo install rtk", &[]), None);
     }
 
     #[test]
     fn test_rewrite_kubectl_describe() {
-        assert_eq!(
-            rewrite_command("kubectl describe pod mypod", &[]),
-            Some("rtk kubectl describe pod mypod".into())
-        );
+        assert_eq!(rewrite_command("kubectl describe pod mypod", &[]), None);
     }
 
     #[test]
     fn test_rewrite_docker_run() {
-        assert_eq!(
-            rewrite_command("docker run --rm ubuntu bash", &[]),
-            Some("rtk docker run --rm ubuntu bash".into())
-        );
+        assert_eq!(rewrite_command("docker run --rm ubuntu bash", &[]), None);
     }
 
     #[test]
@@ -1756,10 +1737,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_swift_test() {
-        assert_eq!(
-            rewrite_command("swift test --parallel", &[]),
-            Some("rtk swift test --parallel".into())
-        );
+        assert_eq!(rewrite_command("swift test --parallel", &[]), None);
     }
 
     // --- #336: docker compose supported subcommands rewritten, unsupported skipped ---
@@ -1774,18 +1752,12 @@ mod tests {
 
     #[test]
     fn test_rewrite_docker_compose_logs() {
-        assert_eq!(
-            rewrite_command("docker compose logs web", &[]),
-            Some("rtk docker compose logs web".into())
-        );
+        assert_eq!(rewrite_command("docker compose logs web", &[]), None);
     }
 
     #[test]
     fn test_rewrite_docker_compose_build() {
-        assert_eq!(
-            rewrite_command("docker compose build", &[]),
-            Some("rtk docker compose build".into())
-        );
+        assert_eq!(rewrite_command("docker compose build", &[]), None);
     }
 
     #[test]
@@ -1854,26 +1826,20 @@ mod tests {
 
     #[test]
     fn test_rewrite_aws() {
-        assert_eq!(
-            rewrite_command("aws s3 ls", &[]),
-            Some("rtk aws s3 ls".into())
-        );
+        assert_eq!(rewrite_command("aws s3 ls", &[]), None);
     }
 
     #[test]
     fn test_rewrite_aws_ec2() {
         assert_eq!(
             rewrite_command("aws ec2 describe-instances --region us-east-1", &[]),
-            Some("rtk aws ec2 describe-instances --region us-east-1".into())
+            None
         );
     }
 
     #[test]
     fn test_rewrite_psql() {
-        assert_eq!(
-            rewrite_command("psql -U postgres -d mydb", &[]),
-            Some("rtk psql -U postgres -d mydb".into())
-        );
+        assert_eq!(rewrite_command("psql -U postgres -d mydb", &[]), None);
     }
 
     // --- Python tooling ---
@@ -2244,18 +2210,12 @@ mod tests {
 
     #[test]
     fn test_rewrite_prisma() {
-        assert_eq!(
-            rewrite_command("npx prisma migrate dev", &[]),
-            Some("rtk prisma migrate dev".into())
-        );
+        assert_eq!(rewrite_command("npx prisma migrate dev", &[]), None);
     }
 
     #[test]
     fn test_rewrite_prettier() {
-        assert_eq!(
-            rewrite_command("npx prettier --check src/", &[]),
-            Some("rtk prettier --check src/".into())
-        );
+        assert_eq!(rewrite_command("npx prettier --check src/", &[]), None);
     }
 
     #[test]
@@ -2263,6 +2223,14 @@ mod tests {
         assert_eq!(
             rewrite_command("pnpm list", &[]),
             Some("rtk pnpm list".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_pnpm_outdated() {
+        assert_eq!(
+            rewrite_command("pnpm outdated", &[]),
+            Some("rtk pnpm outdated".into())
         );
     }
 
@@ -2280,8 +2248,8 @@ mod tests {
     #[test]
     fn test_rewrite_compound_semicolon() {
         assert_eq!(
-            rewrite_command("git status; cargo test", &[]),
-            Some("rtk git status; rtk cargo test".into())
+            rewrite_command("git log -10; cargo test", &[]),
+            Some("rtk git log -10; rtk cargo test".into())
         );
     }
 
@@ -2306,11 +2274,11 @@ mod tests {
     fn test_rewrite_compound_four_segments() {
         assert_eq!(
             rewrite_command(
-                "cargo fmt --all && cargo clippy && cargo test && git status",
+                "cargo check --all && cargo clippy && cargo test && git log -5",
                 &[]
             ),
             Some(
-                "rtk cargo fmt --all && rtk cargo clippy && rtk cargo test && rtk git status"
+                "rtk cargo check --all && rtk cargo clippy && rtk cargo test && rtk git log -5"
                     .into()
             )
         );
@@ -2342,10 +2310,34 @@ mod tests {
     }
 
     #[test]
+    fn test_rewrite_docker_images() {
+        assert_eq!(
+            rewrite_command("docker images", &[]),
+            Some("rtk docker images".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_kubectl_get_pods() {
+        assert_eq!(
+            rewrite_command("kubectl get pods -A", &[]),
+            Some("rtk kubectl get pods -A".into())
+        );
+    }
+
+    #[test]
+    fn test_rewrite_kubectl_get_services() {
+        assert_eq!(
+            rewrite_command("kubectl get services -n prod", &[]),
+            Some("rtk kubectl get services -n prod".into())
+        );
+    }
+
+    #[test]
     fn test_rewrite_env_var_prefix() {
         assert_eq!(
-            rewrite_command("GIT_SSH_COMMAND=ssh git push origin main", &[]),
-            Some("GIT_SSH_COMMAND=ssh rtk git push origin main".into())
+            rewrite_command("GIT_SSH_COMMAND=ssh git log --oneline -5", &[]),
+            Some("GIT_SSH_COMMAND=ssh rtk git log --oneline -5".into())
         );
     }
 
@@ -2353,10 +2345,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_find_with_flags() {
-        assert_eq!(
-            rewrite_command("find . -name '*.rs' -type f", &[]),
-            Some("rtk find . -name '*.rs' -type f".into())
-        );
+        assert_eq!(rewrite_command("find . -name '*.rs' -type f", &[]), None);
     }
 
     #[test]
@@ -2385,35 +2374,34 @@ mod tests {
 
     #[test]
     fn test_rewrite_excludes_curl() {
-        let excluded = vec!["curl".to_string()];
-        assert_eq!(
-            rewrite_command("curl https://api.example.com/health", &excluded),
-            None
-        );
+        let excluded = vec!["git".to_string()];
+        assert_eq!(rewrite_command("git log -10", &excluded), None);
     }
 
     #[test]
     fn test_rewrite_exclude_does_not_affect_other_commands() {
-        let excluded = vec!["curl".to_string()];
+        let excluded = vec!["git".to_string()];
         assert_eq!(
-            rewrite_command("git status", &excluded),
-            Some("rtk git status".into())
+            rewrite_command("cargo test", &excluded),
+            Some("rtk cargo test".into())
         );
     }
 
     #[test]
     fn test_rewrite_empty_excludes_rewrites_curl() {
         let excluded: Vec<String> = vec![];
-        assert!(rewrite_command("curl https://api.example.com", &excluded).is_some());
+        assert_eq!(
+            rewrite_command("git log -10", &excluded),
+            Some("rtk git log -10".into())
+        );
     }
 
     #[test]
     fn test_rewrite_compound_partial_exclude() {
-        // curl excluded but git still rewrites
-        let excluded = vec!["curl".to_string()];
+        let excluded = vec!["git".to_string()];
         assert_eq!(
-            rewrite_command("git status && curl https://api.example.com", &excluded),
-            Some("rtk git status && curl https://api.example.com".into())
+            rewrite_command("git log -10 && cargo test", &excluded),
+            Some("git log -10 && rtk cargo test".into())
         );
     }
 
@@ -2463,10 +2451,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_gh_without_json_still_works() {
-        assert_eq!(
-            rewrite_command("gh pr list", &[]),
-            Some("rtk gh pr list".into())
-        );
+        assert_eq!(rewrite_command("gh pr list", &[]), None);
     }
 
     // --- #508: RTK_DISABLED detection helpers ---
@@ -2602,10 +2587,7 @@ mod tests {
 
     #[test]
     fn test_rewrite_git_dash_c() {
-        assert_eq!(
-            rewrite_command("git -C /tmp status", &[]),
-            Some("rtk git -C /tmp status".to_string())
-        );
+        assert_eq!(rewrite_command("git -C /tmp status", &[]), None);
     }
 
     #[test]

@@ -86,7 +86,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Read file with intelligent filtering
+    /// Read file raw by default; filtering and truncation are explicit summary modes
     Read {
         /// Files to read (supports multiple, like cat)
         #[arg(required = true, num_args = 1..)]
@@ -280,7 +280,7 @@ enum Commands {
         command: Vec<String>,
     },
 
-    /// Compact grep - strips whitespace, truncates, groups by file
+    /// Search raw by default; use `--compact` for grouped summary output
     Grep {
         /// Pattern to search
         pattern: String,
@@ -299,7 +299,10 @@ enum Commands {
         /// Filter by file type (e.g., ts, py, rust)
         #[arg(short = 't', long)]
         file_type: Option<String>,
-        /// Show line numbers (always on, accepted for grep/rg compatibility)
+        /// Show compact grouped summary instead of raw hit-preserving output
+        #[arg(long)]
+        compact: bool,
+        /// Show line numbers (accepted for grep/rg compatibility)
         #[arg(short = 'n', long)]
         line_numbers: bool,
         /// Extra ripgrep arguments (e.g., -i, -A 3, -w, --glob)
@@ -382,6 +385,9 @@ enum Commands {
         /// Filter statistics to current project (current working directory) // added
         #[arg(short, long)]
         project: bool,
+        /// Show RTK evaluation report
+        #[arg(long)]
+        evaluation: bool,
         /// Show ASCII graph of daily savings
         #[arg(short, long)]
         graph: bool,
@@ -608,7 +614,7 @@ enum Commands {
         args: Vec<String>,
     },
 
-    /// Pytest test runner with compact output
+    /// Pytest test runner with raw failures and compact success summaries
     Pytest {
         /// Pytest arguments
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -709,13 +715,13 @@ enum HookCommands {
 
 #[derive(Subcommand)]
 enum GitCommands {
-    /// Condensed diff output
+    /// Raw diff output by default (`--compact` for condensed summary)
     Diff {
         /// Git arguments (supports all git diff flags like --stat, --cached, etc)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// One-line commit history
+    /// Raw commit history by default (`--compact` for one-line summary)
     Log {
         /// Git arguments (supports all git log flags like --oneline, --graph, --all)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -727,7 +733,7 @@ enum GitCommands {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    /// Compact show (commit summary + stat + compacted diff)
+    /// Raw commit output by default (`--compact` for summary + compact diff)
     Show {
         /// Git arguments (supports all git show flags)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
@@ -1154,7 +1160,16 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             }
             Err(e) => {
                 // Command not found — same behaviour as no-TOML path
-                core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
+                core::tracking::record_parse_failure_silent(&raw_command, &error_message, false); // hard failure
+                if let Ok(tracker) = core::tracking::Tracker::new() {
+                    let _ = tracker.record_evaluation(
+                        &raw_command,
+                        &format!("rtk fallback: {}", raw_command),
+                        core::tracking::EvaluationOutcome::HardFailure,
+                        false,
+                        Some("fallback exec failed"),
+                    );
+                }
                 eprintln!("[rtk: {}]", e);
                 Ok(127)
             }
@@ -1170,7 +1185,12 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
 
         match status {
             Ok(s) => {
-                timer.track_passthrough(&raw_command, &format!("rtk fallback: {}", raw_command));
+                timer.track_passthrough_outcome(
+                    &raw_command,
+                    &format!("rtk fallback: {}", raw_command),
+                    core::tracking::EvaluationOutcome::FallbackRecovered,
+                    Some("clap parse fallback"),
+                );
 
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, true);
 
@@ -1178,6 +1198,15 @@ fn run_fallback(parse_error: clap::Error) -> Result<i32> {
             }
             Err(e) => {
                 core::tracking::record_parse_failure_silent(&raw_command, &error_message, false);
+                if let Ok(tracker) = core::tracking::Tracker::new() {
+                    let _ = tracker.record_evaluation(
+                        &raw_command,
+                        &format!("rtk fallback: {}", raw_command),
+                        core::tracking::EvaluationOutcome::HardFailure,
+                        false,
+                        Some("fallback exec failed"),
+                    );
+                }
                 // Command not found or other OS error — single message, no duplicate Clap error
                 eprintln!("[rtk: {}]", e);
                 Ok(127)
@@ -1655,7 +1684,8 @@ fn run_cli() -> Result<i32> {
             max,
             context_only,
             file_type,
-            line_numbers: _, // no-op: line numbers always enabled in grep_cmd::run
+            compact,
+            line_numbers: _, // compatibility-only; raw mode preserves native line output
             extra_args,
         } => grep_cmd::run(
             &pattern,
@@ -1664,6 +1694,7 @@ fn run_cli() -> Result<i32> {
             max,
             context_only,
             file_type.as_deref(),
+            compact,
             &extra_args,
             cli.verbose,
         )?,
@@ -1760,6 +1791,7 @@ fn run_cli() -> Result<i32> {
 
         Commands::Gain {
             project, // added
+            evaluation,
             graph,
             history,
             quota,
@@ -1773,6 +1805,7 @@ fn run_cli() -> Result<i32> {
         } => {
             analytics::gain::run(
                 project, // added: pass project flag
+                evaluation,
                 graph,
                 history,
                 quota,
@@ -2487,6 +2520,18 @@ mod tests {
         if let Ok(cli) = result {
             match cli.command {
                 Commands::Gain { failures, .. } => assert!(failures),
+                _ => panic!("Expected Gain command"),
+            }
+        }
+    }
+
+    #[test]
+    fn test_gain_evaluation_flag_parses() {
+        let result = Cli::try_parse_from(["rtk", "gain", "--evaluation"]);
+        assert!(result.is_ok());
+        if let Ok(cli) = result {
+            match cli.command {
+                Commands::Gain { evaluation, .. } => assert!(evaluation),
                 _ => panic!("Expected Gain command"),
             }
         }

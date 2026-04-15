@@ -1,5 +1,7 @@
 # Build
 /target
+/target-local
+/.cargo-local
 
 # Environment & Secrets
 .env
@@ -45,6 +47,8 @@ claudedocs
 # Vitals provenance data
 .vitals/
 .worktrees/
+.codesight/
+rtk-local.cmd
 
 # icm 
 .fastembed_cache/

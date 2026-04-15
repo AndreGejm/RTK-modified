@@ -21,22 +21,12 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
         c
     };
 
-    let has_tb_flag = args.iter().any(|a| a.starts_with("--tb"));
-    let has_quiet_flag = args.iter().any(|a| a == "-q" || a == "--quiet");
-
-    if !has_tb_flag {
-        cmd.arg("--tb=short");
-    }
-    if !has_quiet_flag {
-        cmd.arg("-q");
-    }
-
     for arg in args {
         cmd.arg(arg);
     }
 
     if verbose > 0 {
-        eprintln!("Running: pytest --tb=short -q {}", args.join(" "));
+        eprintln!("Running: pytest {}", args.join(" "));
     }
 
     runner::run_filtered(

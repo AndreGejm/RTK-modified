@@ -1,19 +1,21 @@
 //! Shows users how many tokens RTK has saved them over time.
 
 use crate::core::display_helpers::{format_duration, print_period_table};
-use crate::core::tracking::{DayStats, MonthStats, Tracker, WeekStats};
+use crate::core::tracking::{DayStats, EvaluationSummary, MonthStats, Tracker, WeekStats};
 use crate::core::utils::format_tokens;
 use crate::hooks::hook_check;
 use anyhow::{Context, Result};
 use chrono::Local;
 use colored::Colorize;
 use serde::Serialize;
+use std::fmt::Write as _;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     project: bool, // added: per-project scope flag
+    evaluation: bool,
     graph: bool,
     history: bool,
     quota: bool,
@@ -28,6 +30,10 @@ pub fn run(
 ) -> Result<()> {
     let tracker = Tracker::new().context("Failed to initialize tracking database")?;
     let project_scope = resolve_project_scope(project)?; // added: resolve project path
+
+    if evaluation {
+        return show_evaluation(&tracker, project_scope.as_deref());
+    }
 
     if failures {
         return show_failures(&tracker);
@@ -301,6 +307,100 @@ pub fn run(
     }
 
     Ok(())
+}
+
+fn show_evaluation(tracker: &Tracker, project_scope: Option<&str>) -> Result<()> {
+    let summary = match project_scope {
+        Some(scope) => tracker.get_evaluation_summary_filtered(Some(scope)),
+        None => tracker.get_evaluation_summary(),
+    }
+    .context("Failed to load evaluation summary from database")?;
+    println!("{}", format_evaluation_report(&summary, project_scope));
+    Ok(())
+}
+
+fn format_evaluation_report(summary: &EvaluationSummary, project_scope: Option<&str>) -> String {
+    let mut out = String::new();
+
+    if summary.total_uses == 0 {
+        writeln!(&mut out, "No evaluation data yet.").expect("write empty evaluation state");
+        writeln!(
+            &mut out,
+            "Run some rtk commands to start tracking evaluation data."
+        )
+        .expect("write empty evaluation hint");
+        return out;
+    }
+
+    writeln!(&mut out, "RTK Evaluation").expect("write evaluation title");
+    if let Some(scope) = project_scope {
+        writeln!(&mut out, "Scope: {}", shorten_path(scope)).expect("write evaluation scope");
+    }
+    writeln!(&mut out, "{}", "─".repeat(60)).expect("write evaluation divider");
+    writeln!(&mut out, "Total RTK uses: {}", summary.total_uses).expect("write total uses");
+    writeln!(&mut out, "Successful uses: {}", summary.successful_uses)
+        .expect("write successful uses");
+    writeln!(&mut out, "Failed uses: {}", summary.failed_uses).expect("write failed uses");
+    writeln!(
+        &mut out,
+        "Compression attempts: {}",
+        summary.compression_attempts
+    )
+    .expect("write compression attempts");
+    writeln!(
+        &mut out,
+        "Compression success rate: {:.1}%",
+        summary.compression_success_rate
+    )
+    .expect("write compression success rate");
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Breakdown by outcome").expect("write outcome section");
+    writeln!(&mut out, "  compressed: {}", summary.compressed_uses).expect("write compressed");
+    writeln!(&mut out, "  preserved_raw: {}", summary.preserved_raw_uses)
+        .expect("write preserved raw");
+    writeln!(
+        &mut out,
+        "  passthrough_expected: {}",
+        summary.passthrough_uses
+    )
+    .expect("write passthrough");
+    writeln!(
+        &mut out,
+        "  fallback_recovered: {}",
+        summary.recovered_failures
+    )
+    .expect("write recovered failures");
+    writeln!(&mut out, "  hard_failure: {}", summary.hard_failures).expect("write hard failures");
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Top failed commands").expect("write top failed commands title");
+    if summary.top_failed_commands.is_empty() {
+        writeln!(&mut out, "  None").expect("write empty failed commands");
+    } else {
+        for (idx, (command, count)) in summary.top_failed_commands.iter().enumerate() {
+            writeln!(&mut out, "  {}. {} ({})", idx + 1, command, count)
+                .expect("write failed command row");
+        }
+    }
+    writeln!(&mut out).expect("write blank line");
+
+    writeln!(&mut out, "Recent failures").expect("write recent failures title");
+    if summary.recent_failures.is_empty() {
+        writeln!(&mut out, "  None").expect("write empty recent failures");
+    } else {
+        for (timestamp, command, reason) in &summary.recent_failures {
+            let reason = if reason.is_empty() {
+                "n/a"
+            } else {
+                reason.as_str()
+            };
+            writeln!(&mut out, "  {} | {} | {}", timestamp, command, reason)
+                .expect("write recent failure row");
+        }
+    }
+
+    out
 }
 
 // ── Display helpers (TTY-aware) ── // added: entire section
@@ -724,4 +824,115 @@ fn show_failures(tracker: &Tracker) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::tracking::Tracker;
+    use std::ffi::OsString;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct TrackingEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        original_db_path: Option<OsString>,
+    }
+
+    impl TrackingEnvGuard {
+        fn new() -> Self {
+            static TRACKING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+            let lock = TRACKING_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("tracking env lock poisoned");
+
+            Self {
+                _lock: lock,
+                original_db_path: std::env::var_os("RTK_DB_PATH"),
+            }
+        }
+
+        fn set_db_path(&self, path: &Path) {
+            unsafe {
+                std::env::set_var("RTK_DB_PATH", path);
+            }
+        }
+    }
+
+    impl Drop for TrackingEnvGuard {
+        fn drop(&mut self) {
+            if let Some(path) = &self.original_db_path {
+                unsafe {
+                    std::env::set_var("RTK_DB_PATH", path);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var("RTK_DB_PATH");
+                }
+            }
+        }
+    }
+
+    fn with_empty_tracking_db<T>(f: impl FnOnce() -> T) -> T {
+        let env_guard = TrackingEnvGuard::new();
+        let tempdir = tempfile::tempdir().expect("Failed to create tracking tempdir");
+        let db_path = tempdir.path().join("history.db");
+        env_guard.set_db_path(&db_path);
+        f()
+    }
+
+    #[test]
+    fn test_format_evaluation_report_shows_core_counts() {
+        let summary = EvaluationSummary {
+            total_uses: 20,
+            successful_uses: 18,
+            failed_uses: 2,
+            compressed_uses: 12,
+            preserved_raw_uses: 4,
+            passthrough_uses: 2,
+            recovered_failures: 1,
+            hard_failures: 1,
+            compression_attempts: 16,
+            compression_success_rate: 75.0,
+            top_failed_commands: vec![("unknowncmd".into(), 2)],
+            recent_failures: vec![(
+                "2026-04-07 12:34".into(),
+                "unknowncmd".into(),
+                "clap parse fallback".into(),
+            )],
+        };
+
+        let text = format_evaluation_report(&summary, None);
+        assert!(text.contains("RTK Evaluation"));
+        assert!(text.contains("Total RTK uses"));
+        assert!(text.contains("Successful uses"));
+        assert!(text.contains("Failed uses"));
+        assert!(text.contains("Compression attempts"));
+        assert!(text.contains("Compression success rate"));
+        assert!(text.contains("Breakdown by outcome"));
+        assert!(text.contains("Top failed commands"));
+        assert!(text.contains("Recent failures"));
+        assert!(text.contains("unknowncmd"));
+        assert!(text.contains("clap parse fallback"));
+    }
+
+    #[test]
+    fn test_format_evaluation_report_empty_db_shows_no_data_message() {
+        with_empty_tracking_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let summary = tracker
+                .get_evaluation_summary_filtered(None)
+                .expect("Failed to load empty evaluation summary");
+
+            assert_eq!(summary.total_uses, 0);
+
+            let text = format_evaluation_report(&summary, None);
+            assert_eq!(
+                text,
+                "No evaluation data yet.\nRun some rtk commands to start tracking evaluation data.\n"
+            );
+        });
+    }
 }

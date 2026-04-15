@@ -1,6 +1,9 @@
 //! Filters Graphite (gt) CLI output for stacking workflows.
 
-use crate::core::tracking;
+use crate::core::{
+    runner::{finish_custom_output, RunOptions},
+    tracking,
+};
 use crate::core::utils::{
     exit_code_from_output, ok_confirmation, resolved_command, strip_ansi, truncate,
 };
@@ -52,26 +55,14 @@ fn run_gt_filtered(
 
     let stdout = String::from_utf8_lossy(&cmd_output.stdout);
     let stderr = String::from_utf8_lossy(&cmd_output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
     let exit_code = exit_code_from_output(&cmd_output, "gt");
 
     let clean = strip_ansi(stdout.trim());
-    let output = if verbose > 0 {
+    let filtered = if verbose > 0 {
         clean.clone()
     } else {
         filter_fn(&clean)
     };
-
-    if let Some(hint) = crate::core::tee::tee_and_hint(&raw, tee_label, exit_code) {
-        println!("{}\n{}", output, hint);
-    } else {
-        println!("{}", output);
-    }
-
-    if !stderr.trim().is_empty() {
-        eprintln!("{}", stderr.trim());
-    }
 
     let label = if args.is_empty() {
         format!("gt {}", subcmd_str)
@@ -79,9 +70,19 @@ fn run_gt_filtered(
         format!("gt {} {}", subcmd_str, args.join(" "))
     };
     let rtk_label = format!("rtk {}", label);
-    timer.track(&label, &rtk_label, &raw, &output);
 
-    Ok(exit_code)
+    Ok(finish_custom_output(
+        &timer,
+        &label,
+        &rtk_label,
+        "gt",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        &clean,
+        exit_code,
+        RunOptions::with_tee(tee_label),
+    ))
 }
 
 fn filter_identity(input: &str) -> String {

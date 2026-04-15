@@ -263,17 +263,43 @@ fn run_vitest(args: &[String], verbose: u8) -> Result<i32> {
     };
 
     let exit_code = crate::core::utils::exit_code_from_output(&output, "vitest");
-    if let Some(hint) = crate::core::tee::tee_and_hint(&combined, "vitest_run", exit_code) {
-        println!("{}\n{}", filtered, hint);
-    } else {
-        println!("{}", filtered);
-    }
-
-    timer.track("vitest run", "rtk vitest run", &combined, &filtered);
-
-    if !output.status.success() {
+    if exit_code != 0 {
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+            if !stdout.ends_with('\n') && !stderr.is_empty() {
+                println!();
+            }
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+            if !stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+        if let Some(hint) = crate::core::tee::force_tee_hint(&combined, "vitest_run")
+            .or_else(|| crate::core::tee::tee_and_hint(&combined, "vitest_run", exit_code))
+        {
+            println!("{}", hint);
+        }
+        timer.track("vitest run", "rtk vitest run", &combined, &combined);
         return Ok(exit_code);
     }
+
+    let display = if filtered.trim_end_matches(&['\r', '\n'][..])
+        != combined.trim_end_matches(&['\r', '\n'][..])
+    {
+        format!("[summary view]\n{}", filtered)
+    } else {
+        filtered.clone()
+    };
+
+    if let Some(hint) = crate::core::tee::force_tee_hint(&combined, "vitest_run") {
+        println!("{}\n{}", display, hint);
+    } else {
+        println!("{}", display);
+    }
+
+    timer.track("vitest run", "rtk vitest run", &combined, &display);
     Ok(0)
 }
 

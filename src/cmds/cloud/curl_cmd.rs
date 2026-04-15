@@ -1,6 +1,9 @@
 //! Runs curl and auto-compresses JSON responses.
 
-use crate::core::tracking;
+use crate::core::{
+    runner::{finish_custom_output, RunOptions},
+    tracking,
+};
 use crate::core::utils::{exit_code_from_output, resolved_command, truncate};
 use crate::json_cmd;
 use anyhow::{Context, Result};
@@ -23,32 +26,26 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     let output = cmd.output().context("Failed to run curl")?;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
+    let exit_code = exit_code_from_output(&output, "curl");
 
-    // Early exit: don't feed HTTP error bodies (HTML 404 etc.) through JSON schema filter
-    if !output.status.success() {
-        let msg = if stderr.trim().is_empty() {
-            stdout.trim().to_string()
-        } else {
-            stderr.trim().to_string()
-        };
-        eprintln!("FAILED: curl {}", msg);
-        return Ok(exit_code_from_output(&output, "curl"));
-    }
-
-    let raw = stdout.to_string();
-
-    // Auto-detect JSON and pipe through filter
+    // Auto-detect JSON and pipe through filter for successful responses only.
+    // Failures always fall open to raw output via the shared custom-output contract.
     let filtered = filter_curl_output(&stdout, args);
-    println!("{}", filtered);
+    let command_label = format!("curl {}", args.join(" "));
+    let rtk_label = format!("rtk curl {}", args.join(" "));
 
-    timer.track(
-        &format!("curl {}", args.join(" ")),
-        &format!("rtk curl {}", args.join(" ")),
-        &raw,
+    Ok(finish_custom_output(
+        &timer,
+        &command_label,
+        &rtk_label,
+        "curl",
+        stdout.as_ref(),
+        stderr.as_ref(),
         &filtered,
-    );
-
-    Ok(0)
+        stdout.as_ref(),
+        exit_code,
+        RunOptions::with_tee("curl"),
+    ))
 }
 
 fn filter_curl_output(output: &str, args: &[String]) -> String {

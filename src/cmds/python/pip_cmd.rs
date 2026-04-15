@@ -1,6 +1,9 @@
 //! Filters pip and uv package manager output.
 
-use crate::core::tracking;
+use crate::core::{
+    runner::{finish_custom_output, RunOptions},
+    tracking,
+};
 use crate::core::utils::{exit_code_from_output, resolved_command, tool_exists};
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -14,8 +17,6 @@ struct Package {
 }
 
 pub fn run(args: &[String], verbose: u8) -> Result<i32> {
-    let timer = tracking::TimedExecution::start();
-
     // Auto-detect uv vs pip
     let use_uv = tool_exists("uv");
     let base_cmd = if use_uv { "uv" } else { "pip" };
@@ -27,30 +28,22 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     // Detect subcommand
     let subcommand = args.first().map(|s| s.as_str()).unwrap_or("");
 
-    let (cmd_str, filtered, exit_code) = match subcommand {
-        "list" => run_list(base_cmd, &args[1..], verbose)?,
-        "outdated" => run_outdated(base_cmd, &args[1..], verbose)?,
+    match subcommand {
+        "list" => run_list(base_cmd, &args[1..], verbose),
+        "outdated" => run_outdated(base_cmd, &args[1..], verbose),
         "install" | "uninstall" | "show" => {
             // Passthrough for write operations
-            run_passthrough(base_cmd, args, verbose)?
+            run_passthrough(base_cmd, args, verbose)
         }
         _ => {
             // Unknown subcommand: passthrough to pip/uv
-            run_passthrough(base_cmd, args, verbose)?
+            run_passthrough(base_cmd, args, verbose)
         }
-    };
-
-    timer.track(
-        &format!("{} {}", base_cmd, args.join(" ")),
-        &format!("rtk {} {}", base_cmd, args.join(" ")),
-        &cmd_str,
-        &filtered,
-    );
-
-    Ok(exit_code)
+    }
 }
 
-fn run_list(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
+fn run_list(base_cmd: &str, args: &[String], verbose: u8) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
     let mut cmd = resolved_command(base_cmd);
 
     if base_cmd == "uv" {
@@ -73,16 +66,35 @@ fn run_list(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, Str
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
     let filtered = filter_pip_list(&stdout);
-    println!("{}", filtered);
-
     let exit_code = exit_code_from_output(&output, "pip");
-    Ok((raw, filtered, exit_code))
+    let command_label = if base_cmd == "uv" {
+        "uv pip list".to_string()
+    } else {
+        "pip list".to_string()
+    };
+    let rtk_label = if base_cmd == "uv" {
+        "rtk uv pip list".to_string()
+    } else {
+        "rtk pip list".to_string()
+    };
+
+    Ok(finish_custom_output(
+        &timer,
+        &command_label,
+        &rtk_label,
+        "pip",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        stdout.as_ref(),
+        exit_code,
+        RunOptions::with_tee("pip_list"),
+    ))
 }
 
-fn run_outdated(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
+fn run_outdated(base_cmd: &str, args: &[String], verbose: u8) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
     let mut cmd = resolved_command(base_cmd);
 
     if base_cmd == "uv" {
@@ -105,16 +117,35 @@ fn run_outdated(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String,
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let raw = format!("{}\n{}", stdout, stderr);
-
     let filtered = filter_pip_outdated(&stdout);
-    println!("{}", filtered);
-
     let exit_code = exit_code_from_output(&output, "pip");
-    Ok((raw, filtered, exit_code))
+    let command_label = if base_cmd == "uv" {
+        "uv pip outdated".to_string()
+    } else {
+        "pip outdated".to_string()
+    };
+    let rtk_label = if base_cmd == "uv" {
+        "rtk uv pip outdated".to_string()
+    } else {
+        "rtk pip outdated".to_string()
+    };
+
+    Ok(finish_custom_output(
+        &timer,
+        &command_label,
+        &rtk_label,
+        "pip",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        stdout.as_ref(),
+        exit_code,
+        RunOptions::with_tee("pip_outdated"),
+    ))
 }
 
-fn run_passthrough(base_cmd: &str, args: &[String], verbose: u8) -> Result<(String, String, i32)> {
+fn run_passthrough(base_cmd: &str, args: &[String], verbose: u8) -> Result<i32> {
+    let timer = tracking::TimedExecution::start();
     let mut cmd = resolved_command(base_cmd);
 
     if base_cmd == "uv" {
@@ -141,7 +172,18 @@ fn run_passthrough(base_cmd: &str, args: &[String], verbose: u8) -> Result<(Stri
     eprint!("{}", stderr);
 
     let exit_code = exit_code_from_output(&output, "pip");
-    Ok((raw.clone(), raw, exit_code))
+    let command_label = if base_cmd == "uv" {
+        format!("uv pip {}", args.join(" "))
+    } else {
+        format!("pip {}", args.join(" "))
+    };
+    let rtk_label = if base_cmd == "uv" {
+        format!("rtk uv pip {}", args.join(" "))
+    } else {
+        format!("rtk pip {}", args.join(" "))
+    };
+    timer.track(&command_label, &rtk_label, &raw, &raw);
+    Ok(exit_code)
 }
 
 /// Filter pip list JSON output

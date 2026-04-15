@@ -11,6 +11,14 @@ use crate::parser::{
     OutputParser, ParseResult, TestFailure, TestResult, TokenFormatter,
 };
 
+fn normalize_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(&['\r', '\n'][..])
+}
+
+fn is_lossy_output(filtered: &str, source: &str) -> bool {
+    normalize_trailing_newlines(filtered) != normalize_trailing_newlines(source)
+}
+
 /// Matches real Playwright JSON reporter output (suites → specs → tests → results)
 #[derive(Debug, Deserialize)]
 struct PlaywrightJsonOutput {
@@ -317,23 +325,57 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     };
 
     let exit_code = crate::core::utils::exit_code_from_output(&output, "playwright");
-    if let Some(hint) = crate::core::tee::tee_and_hint(&raw, "playwright", exit_code) {
-        println!("{}\n{}", filtered, hint);
+    if !output.status.success() {
+        if !stdout.is_empty() {
+            print!("{}", stdout);
+            if !stdout.ends_with('\n') {
+                println!();
+            }
+        }
+        if !stderr.is_empty() {
+            eprint!("{}", stderr);
+            if !stderr.ends_with('\n') {
+                eprintln!();
+            }
+        }
+        if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "playwright")
+            .or_else(|| crate::core::tee::tee_and_hint(&raw, "playwright", exit_code))
+        {
+            println!("{}", hint);
+        }
+        timer.track(
+            &format!("playwright {}", args.join(" ")),
+            &format!("rtk playwright {}", args.join(" ")),
+            &raw,
+            &raw,
+        );
+        return Ok(exit_code);
+    }
+
+    let is_lossy = is_lossy_output(&filtered, &stdout) || !stderr.trim().is_empty();
+    let display = if is_lossy {
+        format!("[summary view]\n{}", filtered)
     } else {
-        println!("{}", filtered);
+        filtered.clone()
+    };
+
+    if let Some(hint) = if is_lossy {
+        crate::core::tee::force_tee_hint(&raw, "playwright")
+            .or_else(|| crate::core::tee::tee_and_hint(&raw, "playwright", exit_code))
+    } else {
+        crate::core::tee::tee_and_hint(&raw, "playwright", exit_code)
+    } {
+        println!("{}\n{}", display, hint);
+    } else {
+        println!("{}", display);
     }
 
     timer.track(
         &format!("playwright {}", args.join(" ")),
         &format!("rtk playwright {}", args.join(" ")),
         &raw,
-        &filtered,
+        &display,
     );
-
-    // Preserve exit code for CI/CD
-    if !output.status.success() {
-        return Ok(exit_code);
-    }
 
     Ok(0)
 }

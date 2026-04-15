@@ -18,6 +18,21 @@ const DOTNET_CLI_UI_LANGUAGE: &str = "DOTNET_CLI_UI_LANGUAGE";
 const DOTNET_CLI_UI_LANGUAGE_VALUE: &str = "en-US";
 static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+fn print_raw_dotnet_output(stdout: &str, stderr: &str) {
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+        if !stdout.ends_with('\n') && !stderr.is_empty() {
+            println!();
+        }
+    }
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+}
+
 pub fn run_build(args: &[String], verbose: u8) -> Result<i32> {
     run_dotnet_with_binlog("build", args, verbose)
 }
@@ -54,13 +69,43 @@ pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
     let check_mode = !has_write_mode_override(args);
     let filtered =
         format_report_summary_or_raw(report_path.as_deref(), check_mode, &raw, command_started_at);
-    println!("{}", filtered);
+    let exit_code = exit_code_from_output(&output, "dotnet");
+
+    if !output.status.success() {
+        print_raw_dotnet_output(&stdout, &stderr);
+        if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "dotnet_format")
+            .or_else(|| crate::core::tee::tee_and_hint(&raw, "dotnet_format", exit_code))
+        {
+            println!("{}", hint);
+        }
+        timer.track(
+            &format!("dotnet format {}", args.join(" ")),
+            &format!("rtk dotnet format {}", args.join(" ")),
+            &raw,
+            &raw,
+        );
+
+        if cleanup_report_path {
+            if let Some(path) = report_path.as_deref() {
+                cleanup_temp_file(path);
+            }
+        }
+
+        return Ok(exit_code);
+    }
+
+    let display = format!("[summary view]\n{}", filtered);
+    if let Some(hint) = crate::core::tee::force_tee_hint(&raw, "dotnet_format") {
+        println!("{}\n{}", display, hint);
+    } else {
+        println!("{}", display);
+    }
 
     timer.track(
         &format!("dotnet format {}", args.join(" ")),
         &format!("rtk dotnet format {}", args.join(" ")),
         &raw,
-        &filtered,
+        &display,
     );
 
     if cleanup_report_path {
@@ -69,7 +114,7 @@ pub fn run_format(args: &[String], verbose: u8) -> Result<i32> {
         }
     }
 
-    Ok(exit_code_from_output(&output, "dotnet"))
+    Ok(exit_code)
 }
 
 pub fn run_passthrough(args: &[OsString], verbose: u8) -> Result<i32> {
@@ -219,21 +264,41 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         _ => raw.clone(),
     };
 
-    let output_to_print = if !output.status.success() {
-        let stdout_trimmed = stdout.trim();
-        let stderr_trimmed = stderr.trim();
-        if !stdout_trimmed.is_empty() {
-            format!("{}\n\n{}", stdout_trimmed, filtered)
-        } else if !stderr_trimmed.is_empty() {
-            format!("{}\n\n{}", stderr_trimmed, filtered)
-        } else {
-            filtered
+    let exit_code = exit_code_from_output(&output, "dotnet");
+    if !output.status.success() {
+        print_raw_dotnet_output(&stdout, &stderr);
+        if let Some(hint) = crate::core::tee::force_tee_hint(&raw, &format!("dotnet_{}", subcommand))
+            .or_else(|| crate::core::tee::tee_and_hint(&raw, &format!("dotnet_{}", subcommand), exit_code))
+        {
+            println!("{}", hint);
         }
-    } else {
-        filtered
-    };
+        timer.track(
+            &format!("dotnet {} {}", subcommand, args.join(" ")),
+            &format!("rtk dotnet {} {}", subcommand, args.join(" ")),
+            &raw,
+            &raw,
+        );
 
-    println!("{}", output_to_print);
+        cleanup_temp_file(&binlog_path);
+        if cleanup_trx_results_dir {
+            if let Some(dir) = trx_results_dir.as_deref() {
+                cleanup_temp_dir(dir);
+            }
+        }
+
+        if verbose > 0 {
+            eprintln!("Binlog cleaned up: {}", binlog_path.display());
+        }
+
+        return Ok(exit_code);
+    }
+
+    let output_to_print = format!("[summary view]\n{}", filtered);
+    if let Some(hint) = crate::core::tee::force_tee_hint(&raw, &format!("dotnet_{}", subcommand)) {
+        println!("{}\n{}", output_to_print, hint);
+    } else {
+        println!("{}", output_to_print);
+    }
 
     timer.track(
         &format!("dotnet {} {}", subcommand, args.join(" ")),
@@ -253,7 +318,7 @@ fn run_dotnet_with_binlog(subcommand: &str, args: &[String], verbose: u8) -> Res
         eprintln!("Binlog cleaned up: {}", binlog_path.display());
     }
 
-    Ok(exit_code_from_output(&output, "dotnet"))
+    Ok(exit_code)
 }
 
 fn build_binlog_path(subcommand: &str) -> PathBuf {

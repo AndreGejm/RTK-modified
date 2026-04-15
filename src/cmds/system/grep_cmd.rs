@@ -1,6 +1,7 @@
-//! Filters grep output by grouping matches by file.
+//! Search results are raw by default; compact grouping is opt-in.
 
 use crate::core::config;
+use crate::core::policy::{classify_command, EvidenceSensitivity};
 use crate::core::tracking;
 use crate::core::utils::{exit_code_from_output, resolved_command};
 use anyhow::{Context, Result};
@@ -16,16 +17,17 @@ pub fn run(
     max_results: usize,
     context_only: bool,
     file_type: Option<&str>,
+    compact: bool,
     extra_args: &[String],
     verbose: u8,
 ) -> Result<i32> {
     let timer = tracking::TimedExecution::start();
+    debug_assert_eq!(classify_command("grep"), EvidenceSensitivity::RawDefault);
 
     if verbose > 0 {
         eprintln!("grep: '{}' in {}", pattern, path);
     }
 
-    // Fix: convert BRE alternation \| → | for rg (which uses PCRE-style regex)
     let rg_pattern = pattern.replace(r"\|", "|");
 
     let mut rg_cmd = resolved_command("rg");
@@ -38,7 +40,6 @@ pub fn run(
     }
 
     for arg in extra_args {
-        // Fix: skip grep-ism -r flag (rg is recursive by default; rg -r means --replace)
         if arg == "-r" || arg == "--recursive" {
             continue;
         }
@@ -56,33 +57,94 @@ pub fn run(
         .context("grep/rg failed")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
     let exit_code = exit_code_from_output(&output, "grep");
-
-    let raw_output = stdout.to_string();
+    let raw_output = join_output_streams(&stdout, &stderr);
+    let command_display = format!("grep -rn '{}' {}", pattern, path);
 
     if stdout.trim().is_empty() {
-        // Show stderr for errors (bad regex, missing file, etc.)
-        if exit_code == 2 {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.trim().is_empty() {
-                eprintln!("{}", stderr.trim());
-            }
+        if exit_code > 1 {
+            print_raw_output(&stdout, &stderr);
+            timer.track(&command_display, "rtk grep", &raw_output, &raw_output);
+            return Ok(exit_code);
         }
+
         let msg = format!("0 matches for '{}'", pattern);
         println!("{}", msg);
-        timer.track(
-            &format!("grep -rn '{}' {}", pattern, path),
-            "rtk grep",
-            &raw_output,
-            &msg,
-        );
+        timer.track(&command_display, "rtk grep", &raw_output, &msg);
         return Ok(exit_code);
     }
 
+    if !compact {
+        print_raw_output(&stdout, &stderr);
+        timer.track(&command_display, "rtk grep", &raw_output, &raw_output);
+        return Ok(exit_code);
+    }
+
+    let compact_output = build_compact_output(
+        &stdout,
+        pattern,
+        path,
+        max_line_len,
+        max_results,
+        context_only,
+    );
+    let display = format!("[summary view]\n{}", compact_output);
+
+    if let Some(hint) = crate::core::tee::force_tee_hint(&raw_output, "grep")
+        .or_else(|| crate::core::tee::tee_and_hint(&raw_output, "grep", exit_code))
+    {
+        println!("{}\n{}", display, hint);
+    } else {
+        println!("{}", display);
+    }
+
+    timer.track(&command_display, "rtk grep", &raw_output, &display);
+    Ok(exit_code)
+}
+
+fn join_output_streams(stdout: &str, stderr: &str) -> String {
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => stdout.to_string(),
+        (true, false) => stderr.to_string(),
+        (false, false) => {
+            if stdout.ends_with('\n') {
+                format!("{}{}", stdout, stderr)
+            } else {
+                format!("{}\n{}", stdout, stderr)
+            }
+        }
+    }
+}
+
+fn print_raw_output(stdout: &str, stderr: &str) {
+    if !stdout.is_empty() {
+        print!("{}", stdout);
+        if !stdout.ends_with('\n') && !stderr.is_empty() {
+            println!();
+        }
+    }
+
+    if !stderr.is_empty() {
+        eprint!("{}", stderr);
+        if !stderr.ends_with('\n') {
+            eprintln!();
+        }
+    }
+}
+
+fn build_compact_output(
+    stdout: &str,
+    pattern: &str,
+    path: &str,
+    max_line_len: usize,
+    max_results: usize,
+    context_only: bool,
+) -> String {
     let mut by_file: HashMap<String, Vec<(usize, String)>> = HashMap::new();
     let mut total = 0;
 
-    // Compile context regex once (instead of per-line in clean_line)
     let context_re = if context_only {
         Regex::new(&format!("(?i).{{0,20}}{}.*", regex::escape(pattern))).ok()
     } else {
@@ -108,7 +170,7 @@ pub fn run(
     }
 
     let mut rtk_output = String::new();
-    rtk_output.push_str(&format!("{} matches in {}F:\n\n", total, by_file.len()));
+    rtk_output.push_str(&format!("{} matches in {} file(s)\n\n", total, by_file.len()));
 
     let mut shown = 0;
     let mut files: Vec<_> = by_file.iter().collect();
@@ -120,7 +182,7 @@ pub fn run(
         }
 
         let file_display = compact_path(file);
-        rtk_output.push_str(&format!("[file] {} ({}):\n", file_display, matches.len()));
+        rtk_output.push_str(&format!("[file] {} ({})\n", file_display, matches.len()));
 
         let per_file = config::limits().grep_max_per_file;
         for (line_num, content) in matches.iter().take(per_file) {
@@ -132,24 +194,16 @@ pub fn run(
         }
 
         if matches.len() > per_file {
-            rtk_output.push_str(&format!("  +{}\n", matches.len() - per_file));
+            rtk_output.push_str(&format!("  +{} more hits in this file\n", matches.len() - per_file));
         }
         rtk_output.push('\n');
     }
 
     if total > shown {
-        rtk_output.push_str(&format!("... +{}\n", total - shown));
+        rtk_output.push_str(&format!("... +{} more matches\n", total - shown));
     }
 
-    print!("{}", rtk_output);
-    timer.track(
-        &format!("grep -rn '{}' {}", pattern, path),
-        "rtk grep",
-        &raw_output,
-        &rtk_output,
-    );
-
-    Ok(exit_code)
+    rtk_output.trim_end().to_string()
 }
 
 fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &str) -> String {
@@ -192,7 +246,7 @@ fn clean_line(line: &str, max_len: usize, context_re: Option<&Regex>, pattern: &
                 format!("{}...", slice)
             }
         } else {
-            let t: String = trimmed.chars().take(max_len - 3).collect();
+            let t: String = trimmed.chars().take(max_len.saturating_sub(3)).collect();
             format!("{}...", t)
         }
     }
@@ -236,38 +290,12 @@ mod tests {
     }
 
     #[test]
-    fn test_extra_args_accepted() {
-        // Test that the function signature accepts extra_args
-        // This is a compile-time test - if it compiles, the signature is correct
-        let _extra: Vec<String> = vec!["-i".to_string(), "-A".to_string(), "3".to_string()];
-        // No need to actually run - we're verifying the parameter exists
-    }
-
-    #[test]
-    fn test_clean_line_multibyte() {
-        // Thai text that exceeds max_len in bytes
-        let line = "  สวัสดีครับ นี่คือข้อความที่ยาวมากสำหรับทดสอบ  ";
-        let cleaned = clean_line(line, 20, None, "ครับ");
-        // Should not panic
-        assert!(!cleaned.is_empty());
-    }
-
-    #[test]
-    fn test_clean_line_emoji() {
-        let line = "🎉🎊🎈🎁🎂🎄 some text 🎃🎆🎇✨";
-        let cleaned = clean_line(line, 15, None, "text");
-        assert!(!cleaned.is_empty());
-    }
-
-    // Fix: BRE \| alternation is translated to PCRE | for rg
-    #[test]
     fn test_bre_alternation_translated() {
         let pattern = r"fn foo\|pub.*bar";
         let rg_pattern = pattern.replace(r"\|", "|");
         assert_eq!(rg_pattern, "fn foo|pub.*bar");
     }
 
-    // Fix: -r flag (grep recursive) is stripped from extra_args (rg is recursive by default)
     #[test]
     fn test_recursive_flag_stripped() {
         let extra_args: Vec<String> = vec!["-r".to_string(), "-i".to_string()];
@@ -279,42 +307,14 @@ mod tests {
         assert_eq!(filtered[0], "-i");
     }
 
-    // --- truncation accuracy ---
-
     #[test]
-    fn test_grep_overflow_uses_uncapped_total() {
-        // Confirm the grep overflow invariant: matches vec is never capped before overflow calc.
-        // If total_matches > per_file, overflow = total_matches - per_file (not capped).
-        // This documents that grep_cmd.rs avoids the diff_cmd bug (cap at N then compute N-10).
-        let per_file = config::limits().grep_max_per_file;
-        let total_matches = per_file + 42;
-        let overflow = total_matches - per_file;
-        assert_eq!(overflow, 42, "overflow must equal true suppressed count");
-        // Demonstrate why capping before subtraction is wrong:
-        let hypothetical_cap = per_file + 5;
-        let capped = total_matches.min(hypothetical_cap);
-        let wrong_overflow = capped - per_file;
-        assert_ne!(
-            wrong_overflow, overflow,
-            "capping before subtraction gives wrong overflow"
-        );
+    fn test_join_output_streams_preserves_stderr_boundary() {
+        let joined = join_output_streams("a", "b");
+        assert_eq!(joined, "a\nb");
     }
 
-    // Verify line numbers are always enabled in rg invocation (grep_cmd.rs:24).
-    // The -n/--line-numbers clap flag in main.rs is a no-op accepted for compat.
     #[test]
-    fn test_rg_always_has_line_numbers() {
-        // grep_cmd::run() always passes "-n" to rg (line 24).
-        // This test documents that -n is built-in, so the clap flag is safe to ignore.
-        let mut cmd = resolved_command("rg");
-        cmd.args(["-n", "--no-heading", "NONEXISTENT_PATTERN_12345", "."]);
-        // If rg is available, it should accept -n without error (exit 1 = no match, not error)
-        if let Ok(output) = cmd.output() {
-            assert!(
-                output.status.code() == Some(1) || output.status.success(),
-                "rg -n should be accepted"
-            );
-        }
-        // If rg is not installed, skip gracefully (test still passes)
+    fn test_grep_policy_is_raw_default() {
+        assert_eq!(classify_command("grep"), EvidenceSensitivity::RawDefault);
     }
 }

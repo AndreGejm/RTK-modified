@@ -1,6 +1,9 @@
 //! Filters Prisma CLI output by stripping ASCII art and verbose decoration.
 
-use crate::core::tracking;
+use crate::core::{
+    runner::{finish_custom_output, RunOptions},
+    tracking,
+};
 use crate::core::utils::{resolved_command, tool_exists};
 use anyhow::{Context, Result};
 use std::process::Command;
@@ -60,23 +63,20 @@ fn run_generate(args: &[String], verbose: u8) -> Result<i32> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
-
-    if !output.status.success() {
-        if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
-        }
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
-        }
-        timer.track("prisma generate", "rtk prisma generate", &raw, &raw);
-        return Ok(exit_code);
-    }
-
     let filtered = filter_prisma_generate(&raw);
-    println!("{}", filtered);
-    timer.track("prisma generate", "rtk prisma generate", &raw, &filtered);
 
-    Ok(0)
+    Ok(finish_custom_output(
+        &timer,
+        "prisma generate",
+        "rtk prisma generate",
+        "prisma",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        &raw,
+        exit_code,
+        RunOptions::with_tee("prisma_generate"),
+    ))
 }
 
 fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> Result<i32> {
@@ -117,28 +117,24 @@ fn run_migrate(subcommand: MigrateSubcommand, args: &[String], verbose: u8) -> R
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
-
-    if !output.status.success() {
-        if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
-        }
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
-        }
-        timer.track(cmd_name, &format!("rtk {}", cmd_name), &raw, &raw);
-        return Ok(exit_code);
-    }
-
-    let filtered = match subcommand {
-        MigrateSubcommand::Dev { .. } => filter_migrate_dev(&raw),
-        MigrateSubcommand::Status => filter_migrate_status(&raw),
-        MigrateSubcommand::Deploy => filter_migrate_deploy(&raw),
+    let (filtered, tee_label) = match subcommand {
+        MigrateSubcommand::Dev { .. } => (filter_migrate_dev(&raw), "prisma_migrate_dev"),
+        MigrateSubcommand::Status => (filter_migrate_status(&raw), "prisma_migrate_status"),
+        MigrateSubcommand::Deploy => (filter_migrate_deploy(&raw), "prisma_migrate_deploy"),
     };
 
-    println!("{}", filtered);
-    timer.track(cmd_name, &format!("rtk {}", cmd_name), &raw, &filtered);
-
-    Ok(0)
+    Ok(finish_custom_output(
+        &timer,
+        cmd_name,
+        &format!("rtk {}", cmd_name),
+        "prisma",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        &raw,
+        exit_code,
+        RunOptions::with_tee(tee_label),
+    ))
 }
 
 fn run_db_push(args: &[String], verbose: u8) -> Result<i32> {
@@ -161,23 +157,20 @@ fn run_db_push(args: &[String], verbose: u8) -> Result<i32> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
     let raw = format!("{}\n{}", stdout, stderr);
-
-    if !output.status.success() {
-        if !stdout.trim().is_empty() {
-            eprint!("{}", stdout);
-        }
-        if !stderr.trim().is_empty() {
-            eprint!("{}", stderr);
-        }
-        timer.track("prisma db push", "rtk prisma db push", &raw, &raw);
-        return Ok(exit_code);
-    }
-
     let filtered = filter_db_push(&raw);
-    println!("{}", filtered);
-    timer.track("prisma db push", "rtk prisma db push", &raw, &filtered);
 
-    Ok(0)
+    Ok(finish_custom_output(
+        &timer,
+        "prisma db push",
+        "rtk prisma db push",
+        "prisma",
+        stdout.as_ref(),
+        stderr.as_ref(),
+        &filtered,
+        &raw,
+        exit_code,
+        RunOptions::with_tee("prisma_db_push"),
+    ))
 }
 
 /// Filter prisma generate output - strip ASCII art, extract counts

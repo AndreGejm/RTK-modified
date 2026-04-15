@@ -13,6 +13,7 @@ use super::constants::{
 use super::integrity;
 
 // Embedded hook script (guards before set -euo pipefail)
+#[cfg_attr(not(unix), allow(dead_code))]
 const REWRITE_HOOK: &str = include_str!("../../hooks/claude/rtk-rewrite.sh");
 
 // Embedded Cursor hook script (preToolUse format)
@@ -26,6 +27,7 @@ const RTK_SLIM: &str = include_str!("../../hooks/claude/rtk-awareness.md");
 const RTK_SLIM_CODEX: &str = include_str!("../../hooks/codex/rtk-awareness.md");
 
 /// Template written by `rtk init` when no filters.toml exists yet.
+#[cfg_attr(not(unix), allow(dead_code))]
 const FILTERS_TEMPLATE: &str = r#"# Project-local RTK filters — commit this file with your repo.
 # Filters here override user-global and built-in filters.
 # Docs: https://github.com/rtk-ai/rtk#custom-filters
@@ -42,6 +44,7 @@ schema_version = 1
 "#;
 
 /// Template for user-global filters (~/.config/rtk/filters.toml).
+#[cfg_attr(not(unix), allow(dead_code))]
 const FILTERS_GLOBAL_TEMPLATE: &str = r#"# User-global RTK filters — apply to all your projects.
 # Project-local .rtk/filters.toml takes precedence over these.
 # Docs: https://github.com/rtk-ai/rtk#custom-filters
@@ -71,6 +74,7 @@ pub enum PatchMode {
 }
 
 /// Result of settings.json patching operation
+#[cfg_attr(not(unix), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum PatchResult {
     Patched,        // Hook was added successfully
@@ -299,6 +303,7 @@ pub fn run(
 }
 
 /// Prepare hook directory and return paths (hook_dir, hook_path)
+#[cfg_attr(not(unix), allow(dead_code))]
 fn prepare_hook_paths() -> Result<(PathBuf, PathBuf)> {
     let claude_dir = resolve_claude_dir()?;
     let hook_dir = claude_dir.join("hooks");
@@ -416,6 +421,7 @@ fn atomic_write(path: &Path, content: &str) -> Result<()> {
 /// Prompt user for consent to patch settings.json
 /// Prints to stderr (stdout may be piped), reads from stdin
 /// Default is No (capital N)
+#[cfg_attr(not(unix), allow(dead_code))]
 fn prompt_user_consent(settings_path: &Path) -> Result<bool> {
     use std::io::{self, BufRead, IsTerminal};
 
@@ -498,6 +504,8 @@ fn prompt_telemetry_consent() -> Result<()> {
     Ok(())
 }
 
+/// Print manual instructions for settings.json patching
+#[cfg_attr(not(unix), allow(dead_code))]
 fn print_manual_instructions(hook_path: &Path, include_opencode: bool) {
     println!("\n  MANUAL STEP: Add this to ~/.claude/settings.json:");
     println!("  {{");
@@ -760,6 +768,7 @@ fn uninstall_codex_at(codex_dir: &Path, verbose: u8) -> Result<Vec<String>> {
 
 /// Orchestrator: patch settings.json with RTK hook
 /// Handles reading, checking, prompting, merging, backing up, and atomic writing
+#[cfg_attr(not(unix), allow(dead_code))]
 fn patch_settings_json(
     hook_path: &Path,
     mode: PatchMode,
@@ -878,6 +887,7 @@ fn clean_double_blanks(content: &str) -> String {
 
 /// Deep-merge RTK hook entry into settings.json
 /// Creates hooks.PreToolUse structure if missing, preserves existing hooks
+#[cfg_attr(not(unix), allow(dead_code))]
 fn insert_hook_entry(root: &mut serde_json::Value, hook_command: &str) {
     // Ensure root is an object
     let root_obj = match root.as_object_mut() {
@@ -1034,6 +1044,7 @@ fn run_default_mode(
 }
 
 /// Generate .rtk/filters.toml template in the current directory if not present.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn generate_project_filters_template(verbose: u8) -> Result<()> {
     let rtk_dir = std::path::Path::new(".rtk");
     let path = rtk_dir.join("filters.toml");
@@ -1058,6 +1069,7 @@ fn generate_project_filters_template(verbose: u8) -> Result<()> {
 }
 
 /// Generate ~/.config/rtk/filters.toml template if not present.
+#[cfg_attr(not(unix), allow(dead_code))]
 fn generate_global_filters_template(verbose: u8) -> Result<()> {
     let config_dir = dirs::config_dir().unwrap_or_else(|| std::path::PathBuf::from(".config"));
     let rtk_dir = config_dir.join(crate::core::constants::RTK_DATA_DIR);
@@ -1521,6 +1533,7 @@ fn upsert_rtk_block(content: &str, block: &str) -> (String, RtkBlockUpsert) {
 }
 
 /// Patch CLAUDE.md: add @RTK.md, migrate if old block exists
+#[cfg_attr(not(unix), allow(dead_code))]
 fn patch_claude_md(path: &Path, verbose: u8) -> Result<bool> {
     let mut content = if path.exists() {
         fs::read_to_string(path)?

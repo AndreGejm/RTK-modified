@@ -23,16 +23,7 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
     }
 
     let mut cmd = resolved_command("tree");
-
-    let show_all = args.iter().any(|a| a == "-a" || a == "--all");
-    let has_ignore = args.iter().any(|a| a == "-I" || a.starts_with("--ignore="));
-
-    if !show_all && !has_ignore {
-        let ignore_pattern = NOISE_DIRS.join("|");
-        cmd.arg("-I").arg(&ignore_pattern);
-    }
-
-    for arg in args {
+    for arg in build_tree_args(args, !cfg!(windows)) {
         cmd.arg(arg);
     }
 
@@ -60,6 +51,21 @@ pub fn run(args: &[String], verbose: u8) -> Result<i32> {
             .early_exit_on_failure()
             .no_trailing_newline(),
     )
+}
+
+fn build_tree_args(args: &[String], supports_ignore_pattern: bool) -> Vec<String> {
+    let show_all = args.iter().any(|a| a == "-a" || a == "--all");
+    let has_ignore = args.iter().any(|a| a == "-I" || a.starts_with("--ignore="));
+
+    let mut effective_args = Vec::new();
+
+    if supports_ignore_pattern && !show_all && !has_ignore {
+        effective_args.push("-I".to_string());
+        effective_args.push(NOISE_DIRS.join("|"));
+    }
+
+    effective_args.extend(args.iter().cloned());
+    effective_args
 }
 
 fn filter_tree_output(raw: &str) -> String {
@@ -96,6 +102,44 @@ fn filter_tree_output(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_tree_args_injects_ignore_pattern_when_supported() {
+        let args = vec![".".to_string()];
+
+        let effective = build_tree_args(&args, true);
+
+        assert_eq!(effective[0], "-I");
+        assert_eq!(effective[1], NOISE_DIRS.join("|"));
+        assert_eq!(effective[2], ".");
+    }
+
+    #[test]
+    fn test_build_tree_args_skips_ignore_pattern_when_unsupported() {
+        let args = vec![".".to_string()];
+
+        let effective = build_tree_args(&args, false);
+
+        assert_eq!(effective, vec![".".to_string()]);
+    }
+
+    #[test]
+    fn test_build_tree_args_respects_explicit_show_all() {
+        let args = vec!["-a".to_string(), ".".to_string()];
+
+        let effective = build_tree_args(&args, true);
+
+        assert_eq!(effective, args);
+    }
+
+    #[test]
+    fn test_build_tree_args_respects_user_ignore_pattern() {
+        let args = vec!["-I".to_string(), "vendor".to_string(), ".".to_string()];
+
+        let effective = build_tree_args(&args, true);
+
+        assert_eq!(effective, args);
+    }
 
     #[test]
     fn test_filter_removes_summary() {

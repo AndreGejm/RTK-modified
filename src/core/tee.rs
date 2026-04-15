@@ -190,30 +190,22 @@ pub fn tee_and_hint(raw: &str, command_slug: &str, exit_code: i32) -> Option<Str
     Some(format_hint(&path))
 }
 
-/// Force tee output regardless of exit code (used when filters truncate).
-/// Always writes file if size >= MIN_TEE_SIZE and tee is enabled.
+/// Force tee output regardless of exit code (used when filters truncate or summarize).
+/// Always writes file unless explicitly disabled via `RTK_TEE=0`, even for small but
+/// decision-critical outputs.
 /// Returns hint string if file was written, None if skipped/disabled.
 ///
-/// Used by AWS filters when FilterResult.truncated = true, ensuring
-/// the LLM has access to full untruncated output via the hint path.
+/// Used when summaries remove detail and the LLM needs a reliable raw recovery path.
 pub fn force_tee_hint(raw: &str, command_slug: &str) -> Option<String> {
     // Check RTK_TEE=0 env override (disable)
     if std::env::var("RTK_TEE").ok().as_deref() == Some("0") {
         return None;
     }
 
-    // Skip if output too small
-    if raw.len() < MIN_TEE_SIZE {
-        return None;
-    }
-
     let config = Config::load().ok()?;
 
-    // Respect enabled flag but ignore mode (force tee)
-    if !config.tee.enabled {
-        return None;
-    }
-
+    // Ignore normal tee enabled/mode gating here; summary recovery should stay
+    // available unless explicitly disabled via RTK_TEE=0.
     let tee_dir = get_tee_dir(&config)?;
     let tee_dir = std::fs::create_dir_all(&tee_dir).ok().and(Some(tee_dir))?;
 
@@ -487,11 +479,18 @@ directory = "/tmp/rtk-tee"
     }
 
     #[test]
-    fn test_force_tee_hint_skip_small_output() {
-        // force_tee_hint should respect MIN_TEE_SIZE
+    fn test_force_tee_hint_preserves_small_output() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        std::env::set_var("RTK_TEE_DIR", tmpdir.path());
+
         let small_output = "short error";
         let hint = force_tee_hint(small_output, "test_cmd");
-        assert!(hint.is_none(), "Should skip output < MIN_TEE_SIZE");
+
+        std::env::remove_var("RTK_TEE_DIR");
+
+        assert!(hint.is_some(), "Should preserve small summarized output");
+        let entries: Vec<_> = fs::read_dir(tmpdir.path()).unwrap().collect();
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

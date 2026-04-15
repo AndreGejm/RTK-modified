@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn test_get_rewritten_supported() {
-        assert!(get_rewritten("git status").is_some());
+        assert!(get_rewritten("git log -10").is_some());
     }
 
     #[test]
@@ -320,8 +320,8 @@ mod tests {
     fn test_gemini_hook_uses_rewrite_command() {
         // Verify that rewrite_command handles the cases we need for Gemini
         assert_eq!(
-            rewrite_command("git status", &[]),
-            Some("rtk git status".into())
+            rewrite_command("git log -10", &[]),
+            Some("rtk git log -10".into())
         );
         assert_eq!(
             rewrite_command("cargo test", &[]),
@@ -338,12 +338,12 @@ mod tests {
 
     #[test]
     fn test_gemini_hook_excluded_commands() {
-        let excluded = vec!["curl".to_string()];
-        assert_eq!(rewrite_command("curl https://example.com", &excluded), None);
+        let excluded = vec!["git".to_string()];
+        assert_eq!(rewrite_command("git log -10", &excluded), None);
         // Non-excluded still rewrites
         assert_eq!(
-            rewrite_command("git status", &excluded),
-            Some("rtk git status".into())
+            rewrite_command("cargo test", &excluded),
+            Some("rtk cargo test".into())
         );
     }
 

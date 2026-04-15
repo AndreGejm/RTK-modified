@@ -55,7 +55,7 @@ mod tests {
 
     #[test]
     fn test_run_supported_command_succeeds() {
-        assert!(registry::rewrite_command("git status", &[]).is_some());
+        assert!(registry::rewrite_command("git log -10", &[]).is_some());
     }
 
     #[test]
@@ -141,14 +141,14 @@ mod tests {
         fn test_no_auto_allow_bypass_for_unrecognized_commands() {
             // SECURITY: A command with no permission rules and no matching allow rule
             // must NOT be auto-allowed. This is the core of issue #1155.
-            // Even though `git status` can be rewritten to `rtk git status`,
+            // Even though `git log` can be rewritten to `rtk git log`,
             // the absence of an allow rule means Default → exit 3 → ask.
-            let verdict = check_command_with_rules("git status", &[], &[], &[]);
+            let verdict = check_command_with_rules("git log -1", &[], &[], &[]);
             assert_eq!(verdict, PermissionVerdict::Default);
 
             // Verify the rewrite exists (so the hook would output it),
             // but the exit code forces user confirmation.
-            assert!(registry::rewrite_command("git status", &[]).is_some());
+            assert!(registry::rewrite_command("git log -1", &[]).is_some());
             assert_eq!(expected_exit_code(&verdict), 3);
         }
 

@@ -133,6 +133,45 @@ pub struct GainSummary {
     pub by_day: Vec<(String, usize)>,
 }
 
+/// Outcome recorded for an evaluation event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvaluationOutcome {
+    Compressed,
+    PreservedRaw,
+    PassthroughExpected,
+    FallbackRecovered,
+    HardFailure,
+}
+
+impl EvaluationOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Compressed => "compressed",
+            Self::PreservedRaw => "preserved_raw",
+            Self::PassthroughExpected => "passthrough_expected",
+            Self::FallbackRecovered => "fallback_recovered",
+            Self::HardFailure => "hard_failure",
+        }
+    }
+}
+
+/// Aggregated statistics for RTK evaluation reporting.
+#[derive(Debug)]
+pub struct EvaluationSummary {
+    pub total_uses: usize,
+    pub successful_uses: usize,
+    pub failed_uses: usize,
+    pub compressed_uses: usize,
+    pub preserved_raw_uses: usize,
+    pub passthrough_uses: usize,
+    pub recovered_failures: usize,
+    pub hard_failures: usize,
+    pub compression_attempts: usize,
+    pub compression_success_rate: f64,
+    pub top_failed_commands: Vec<(String, usize)>,
+    pub recent_failures: Vec<(String, String, String)>,
+}
+
 /// Daily statistics for token savings and execution metrics.
 ///
 /// Serializable to JSON for export via `rtk gain --daily --format json`.
@@ -323,6 +362,24 @@ impl Tracker {
             [],
         )?;
 
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS evaluation_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                original_cmd TEXT NOT NULL,
+                rtk_cmd TEXT NOT NULL,
+                project_path TEXT DEFAULT '',
+                outcome TEXT NOT NULL,
+                compression_attempted INTEGER NOT NULL DEFAULT 0,
+                failure_reason TEXT
+            )",
+            [],
+        )?;
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_eval_project_timestamp ON evaluation_events(project_path, timestamp)",
+            [],
+        )?;
+
         Ok(Self { conn })
     }
 
@@ -395,6 +452,10 @@ impl Tracker {
             "DELETE FROM parse_failures WHERE timestamp < ?1",
             params![cutoff.to_rfc3339()],
         )?;
+        self.conn.execute(
+            "DELETE FROM evaluation_events WHERE timestamp < ?1",
+            params![cutoff.to_rfc3339()],
+        )?;
         Ok(())
     }
 
@@ -415,6 +476,35 @@ impl Tracker {
                 fallback_succeeded as i32,
             ],
         )?;
+        self.cleanup_old()?;
+        Ok(())
+    }
+
+    /// Record an evaluation event for RTK evaluation reporting.
+    pub fn record_evaluation(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        outcome: EvaluationOutcome,
+        compression_attempted: bool,
+        failure_reason: Option<&str>,
+    ) -> Result<()> {
+        let project_path = current_project_path_string();
+
+        self.conn.execute(
+            "INSERT INTO evaluation_events (timestamp, original_cmd, rtk_cmd, project_path, outcome, compression_attempted, failure_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                Utc::now().to_rfc3339(),
+                original_cmd,
+                rtk_cmd,
+                project_path,
+                outcome.as_str(),
+                compression_attempted as i32,
+                failure_reason,
+            ],
+        )?;
+
         self.cleanup_old()?;
         Ok(())
     }
@@ -474,6 +564,112 @@ impl Tracker {
             recovery_rate,
             top_commands,
             recent,
+        })
+    }
+
+    /// Get evaluation summary for `rtk gain --evaluation`.
+    pub fn get_evaluation_summary(&self) -> Result<EvaluationSummary> {
+        self.get_evaluation_summary_filtered(None)
+    }
+
+    /// Get evaluation summary filtered by project path.
+    pub fn get_evaluation_summary_filtered(
+        &self,
+        project_path: Option<&str>,
+    ) -> Result<EvaluationSummary> {
+        let (project_exact, project_glob) = project_filter_params(project_path);
+
+        let totals = self.conn.query_row(
+            "SELECT
+                COUNT(*),
+                COALESCE(SUM(CASE WHEN outcome = 'compressed' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN outcome = 'preserved_raw' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN outcome = 'passthrough_expected' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN outcome = 'fallback_recovered' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN outcome = 'hard_failure' THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN compression_attempted = 1 THEN 1 ELSE 0 END), 0)
+             FROM evaluation_events
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)",
+            params![project_exact.clone(), project_glob.clone()],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)? as usize,
+                    row.get::<_, i64>(1)? as usize,
+                    row.get::<_, i64>(2)? as usize,
+                    row.get::<_, i64>(3)? as usize,
+                    row.get::<_, i64>(4)? as usize,
+                    row.get::<_, i64>(5)? as usize,
+                    row.get::<_, i64>(6)? as usize,
+                ))
+            },
+        )?;
+
+        let (
+            total_uses,
+            compressed_uses,
+            preserved_raw_uses,
+            passthrough_uses,
+            recovered_failures,
+            hard_failures,
+            compression_attempts,
+        ) = totals;
+        let successful_uses = compressed_uses + preserved_raw_uses + passthrough_uses;
+        let failed_uses = recovered_failures + hard_failures;
+        let compression_success_rate = if compression_attempts > 0 {
+            (compressed_uses as f64 / compression_attempts as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        let mut stmt = self.conn.prepare(
+            "SELECT original_cmd, COUNT(*) as cnt
+             FROM evaluation_events
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+               AND outcome IN ('fallback_recovered', 'hard_failure')
+             GROUP BY original_cmd
+             ORDER BY cnt DESC, original_cmd ASC
+             LIMIT 10",
+        )?;
+
+        let top_failed_commands = stmt
+            .query_map(
+                params![project_exact.clone(), project_glob.clone()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as usize)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut stmt = self.conn.prepare(
+            "SELECT timestamp, original_cmd, COALESCE(failure_reason, '')
+             FROM evaluation_events
+             WHERE (?1 IS NULL OR project_path = ?1 OR project_path GLOB ?2)
+               AND outcome IN ('fallback_recovered', 'hard_failure')
+             ORDER BY timestamp DESC
+             LIMIT 10",
+        )?;
+
+        let recent_failures = stmt
+            .query_map(params![project_exact, project_glob], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(EvaluationSummary {
+            total_uses,
+            successful_uses,
+            failed_uses,
+            compressed_uses,
+            preserved_raw_uses,
+            passthrough_uses,
+            recovered_failures,
+            hard_failures,
+            compression_attempts,
+            compression_success_rate,
+            top_failed_commands,
+            recent_failures,
         })
     }
 
@@ -1222,6 +1418,10 @@ pub fn estimate_tokens(text: &str) -> usize {
     (text.len() as f64 / 4.0).ceil() as usize
 }
 
+fn normalize_trailing_newlines(text: &str) -> &str {
+    text.trim_end_matches(&['\r', '\n'][..])
+}
+
 /// Helper struct for timing command execution
 /// Helper for timing command execution and tracking results.
 ///
@@ -1289,10 +1489,17 @@ impl TimedExecution {
     /// let output = "short output";
     /// timer.track("ls -la", "rtk ls", input, output);
     /// ```
-    pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
+    fn record_with_evaluation(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        tokens: (usize, usize),
+        outcome: EvaluationOutcome,
+        compression_attempted: bool,
+        failure_reason: Option<&str>,
+    ) {
         let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        let input_tokens = estimate_tokens(input);
-        let output_tokens = estimate_tokens(output);
+        let (input_tokens, output_tokens) = tokens;
 
         if let Ok(tracker) = Tracker::new() {
             let _ = tracker.record(
@@ -1302,7 +1509,33 @@ impl TimedExecution {
                 output_tokens,
                 elapsed_ms,
             );
+            let _ = tracker.record_evaluation(
+                original_cmd,
+                rtk_cmd,
+                outcome,
+                compression_attempted,
+                failure_reason,
+            );
         }
+    }
+
+    pub fn track(&self, original_cmd: &str, rtk_cmd: &str, input: &str, output: &str) {
+        let input_tokens = estimate_tokens(input);
+        let output_tokens = estimate_tokens(output);
+        let outcome = if normalize_trailing_newlines(input) == normalize_trailing_newlines(output) {
+            EvaluationOutcome::PreservedRaw
+        } else {
+            EvaluationOutcome::Compressed
+        };
+
+        self.record_with_evaluation(
+            original_cmd,
+            rtk_cmd,
+            (input_tokens, output_tokens),
+            outcome,
+            input_tokens > 0,
+            None,
+        );
     }
 
     /// Track passthrough commands (timing-only, no token counting).
@@ -1326,11 +1559,30 @@ impl TimedExecution {
     /// timer.track_passthrough("git tag", "rtk git tag");
     /// ```
     pub fn track_passthrough(&self, original_cmd: &str, rtk_cmd: &str) {
-        let elapsed_ms = self.start.elapsed().as_millis() as u64;
-        // input_tokens=0, output_tokens=0 won't dilute savings statistics
-        if let Ok(tracker) = Tracker::new() {
-            let _ = tracker.record(original_cmd, rtk_cmd, 0, 0, elapsed_ms);
-        }
+        self.track_passthrough_outcome(
+            original_cmd,
+            rtk_cmd,
+            EvaluationOutcome::PassthroughExpected,
+            None,
+        );
+    }
+
+    /// Track passthrough execution with an explicit evaluation outcome.
+    pub fn track_passthrough_outcome(
+        &self,
+        original_cmd: &str,
+        rtk_cmd: &str,
+        outcome: EvaluationOutcome,
+        failure_reason: Option<&str>,
+    ) {
+        self.record_with_evaluation(
+            original_cmd,
+            rtk_cmd,
+            (0, 0),
+            outcome,
+            false,
+            failure_reason,
+        );
     }
 }
 
@@ -1358,6 +1610,55 @@ pub fn args_display(args: &[OsString]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct TrackingEnvGuard {
+        _lock: MutexGuard<'static, ()>,
+        original_db_path: Option<OsString>,
+    }
+
+    impl TrackingEnvGuard {
+        fn new() -> Self {
+            static TRACKING_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+            let lock = TRACKING_ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("tracking env lock poisoned");
+
+            Self {
+                _lock: lock,
+                original_db_path: std::env::var_os("RTK_DB_PATH"),
+            }
+        }
+
+        fn set_db_path(&self, path: &Path) {
+            std::env::set_var("RTK_DB_PATH", path);
+        }
+
+        fn clear_db_path(&self) {
+            std::env::remove_var("RTK_DB_PATH");
+        }
+    }
+
+    impl Drop for TrackingEnvGuard {
+        fn drop(&mut self) {
+            if let Some(path) = &self.original_db_path {
+                std::env::set_var("RTK_DB_PATH", path);
+            } else {
+                std::env::remove_var("RTK_DB_PATH");
+            }
+        }
+    }
+
+    fn with_tracking_test_db<T>(f: impl FnOnce() -> T) -> T {
+        let env_guard = TrackingEnvGuard::new();
+        let tempdir = tempfile::tempdir().expect("Failed to create tracking tempdir");
+        let db_path = tempdir.path().join("history.db");
+        env_guard.set_db_path(&db_path);
+        f()
+    }
 
     // 1. estimate_tokens — verify ~4 chars/token ratio
     #[test]
@@ -1383,101 +1684,109 @@ mod tests {
     // 3. Tracker::record + get_recent — round-trip DB
     #[test]
     fn test_tracker_record_and_recent() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
 
-        // Use unique test identifier to avoid conflicts with other tests
-        let test_cmd = format!("rtk git status test_{}", std::process::id());
+            // Use unique test identifier to avoid conflicts with other tests
+            let test_cmd = format!("rtk git status test_{}", std::process::id());
 
-        tracker
-            .record("git status", &test_cmd, 100, 20, 50)
-            .expect("Failed to record");
+            tracker
+                .record("git status", &test_cmd, 100, 20, 50)
+                .expect("Failed to record");
 
-        let recent = tracker.get_recent(10).expect("Failed to get recent");
+            let recent = tracker.get_recent(10).expect("Failed to get recent");
 
-        // Find our specific test record
-        let test_record = recent
-            .iter()
-            .find(|r| r.rtk_cmd == test_cmd)
-            .expect("Test record not found in recent commands");
+            // Find our specific test record
+            let test_record = recent
+                .iter()
+                .find(|r| r.rtk_cmd == test_cmd)
+                .expect("Test record not found in recent commands");
 
-        assert_eq!(test_record.saved_tokens, 80);
-        assert_eq!(test_record.savings_pct, 80.0);
+            assert_eq!(test_record.saved_tokens, 80);
+            assert_eq!(test_record.savings_pct, 80.0);
+        });
     }
 
     // 4. track_passthrough doesn't dilute stats (input=0, output=0)
     #[test]
     fn test_track_passthrough_no_dilution() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
 
-        // Use unique test identifiers
-        let pid = std::process::id();
-        let cmd1 = format!("rtk cmd1_test_{}", pid);
-        let cmd2 = format!("rtk cmd2_passthrough_test_{}", pid);
+            // Use unique test identifiers
+            let pid = std::process::id();
+            let cmd1 = format!("rtk cmd1_test_{}", pid);
+            let cmd2 = format!("rtk cmd2_passthrough_test_{}", pid);
 
-        // Record one real command with 80% savings
-        tracker
-            .record("cmd1", &cmd1, 1000, 200, 10)
-            .expect("Failed to record cmd1");
+            // Record one real command with 80% savings
+            tracker
+                .record("cmd1", &cmd1, 1000, 200, 10)
+                .expect("Failed to record cmd1");
 
-        // Record passthrough (0, 0)
-        tracker
-            .record("cmd2", &cmd2, 0, 0, 5)
-            .expect("Failed to record passthrough");
+            // Record passthrough (0, 0)
+            tracker
+                .record("cmd2", &cmd2, 0, 0, 5)
+                .expect("Failed to record passthrough");
 
-        // Verify both records exist in recent history
-        let recent = tracker.get_recent(20).expect("Failed to get recent");
+            // Verify both records exist in recent history
+            let recent = tracker.get_recent(20).expect("Failed to get recent");
 
-        let record1 = recent
-            .iter()
-            .find(|r| r.rtk_cmd == cmd1)
-            .expect("cmd1 record not found");
-        let record2 = recent
-            .iter()
-            .find(|r| r.rtk_cmd == cmd2)
-            .expect("passthrough record not found");
+            let record1 = recent
+                .iter()
+                .find(|r| r.rtk_cmd == cmd1)
+                .expect("cmd1 record not found");
+            let record2 = recent
+                .iter()
+                .find(|r| r.rtk_cmd == cmd2)
+                .expect("passthrough record not found");
 
-        // Verify cmd1 has 80% savings
-        assert_eq!(record1.saved_tokens, 800);
-        assert_eq!(record1.savings_pct, 80.0);
+            // Verify cmd1 has 80% savings
+            assert_eq!(record1.saved_tokens, 800);
+            assert_eq!(record1.savings_pct, 80.0);
 
-        // Verify passthrough has 0% savings
-        assert_eq!(record2.saved_tokens, 0);
-        assert_eq!(record2.savings_pct, 0.0);
+            // Verify passthrough has 0% savings
+            assert_eq!(record2.saved_tokens, 0);
+            assert_eq!(record2.savings_pct, 0.0);
 
-        // This validates that passthrough (0 input, 0 output) doesn't dilute stats
-        // because the savings calculation is correct for both cases
+            // This validates that passthrough (0 input, 0 output) doesn't dilute stats
+            // because the savings calculation is correct for both cases
+        });
     }
 
     // 5. TimedExecution::track records with exec_time > 0
     #[test]
     fn test_timed_execution_records_time() {
-        let timer = TimedExecution::start();
-        std::thread::sleep(std::time::Duration::from_millis(10));
-        timer.track("test cmd", "rtk test", "raw input data", "filtered");
+        with_tracking_test_db(|| {
+            let timer = TimedExecution::start();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            timer.track("test cmd", "rtk test", "raw input data", "filtered");
 
-        // Verify via DB that record exists
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
-        assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+            // Verify via DB that record exists
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let recent = tracker.get_recent(5).expect("Failed to get recent");
+            assert!(recent.iter().any(|r| r.rtk_cmd == "rtk test"));
+        });
     }
 
     // 6. TimedExecution::track_passthrough records with 0 tokens
     #[test]
     fn test_timed_execution_passthrough() {
-        let timer = TimedExecution::start();
-        timer.track_passthrough("git tag", "rtk git tag (passthrough)");
+        with_tracking_test_db(|| {
+            let timer = TimedExecution::start();
+            timer.track_passthrough("git tag", "rtk git tag (passthrough)");
 
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let recent = tracker.get_recent(5).expect("Failed to get recent");
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let recent = tracker.get_recent(5).expect("Failed to get recent");
 
-        let pt = recent
-            .iter()
-            .find(|r| r.rtk_cmd.contains("passthrough"))
-            .expect("Passthrough record not found");
+            let pt = recent
+                .iter()
+                .find(|r| r.rtk_cmd.contains("passthrough"))
+                .expect("Passthrough record not found");
 
-        // savings_pct should be 0 for passthrough
-        assert_eq!(pt.savings_pct, 0.0);
-        assert_eq!(pt.saved_tokens, 0);
+            // savings_pct should be 0 for passthrough
+            assert_eq!(pt.savings_pct, 0.0);
+            assert_eq!(pt.saved_tokens, 0);
+        });
     }
 
     // 7. get_db_path respects environment variable RTK_DB_PATH
@@ -1485,22 +1794,19 @@ mod tests {
     fn test_custom_db_path_env() {
         use std::env;
 
+        let env_guard = TrackingEnvGuard::new();
         let custom_path = env::temp_dir().join("rtk_test_custom.db");
-        env::set_var("RTK_DB_PATH", &custom_path);
+        env_guard.set_db_path(&custom_path);
 
         let db_path = get_db_path().expect("Failed to get db path");
         assert_eq!(db_path, custom_path);
-
-        env::remove_var("RTK_DB_PATH");
     }
 
     // 8. get_db_path falls back to default when no custom config
     #[test]
     fn test_default_db_path() {
-        use std::env;
-
-        // Ensure no env var is set
-        env::remove_var("RTK_DB_PATH");
+        let env_guard = TrackingEnvGuard::new();
+        env_guard.clear_db_path();
 
         let db_path = get_db_path().expect("Failed to get db path");
         assert!(db_path.ends_with("rtk/history.db"));
@@ -1547,41 +1853,186 @@ mod tests {
     // 12. record_parse_failure + get_parse_failure_summary roundtrip
     #[test]
     fn test_parse_failure_roundtrip() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let test_cmd = format!("git -C /path status test_{}", std::process::id());
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let test_cmd = format!("git -C /path status test_{}", std::process::id());
 
-        tracker
-            .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
-            .expect("Failed to record parse failure");
+            tracker
+                .record_parse_failure(&test_cmd, "unrecognized subcommand", true)
+                .expect("Failed to record parse failure");
 
-        let summary = tracker
-            .get_parse_failure_summary()
-            .expect("Failed to get summary");
+            let summary = tracker
+                .get_parse_failure_summary()
+                .expect("Failed to get summary");
 
-        assert!(summary.total >= 1);
-        assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
+            assert!(summary.total >= 1);
+            assert!(summary.recent.iter().any(|r| r.raw_command == test_cmd));
+        });
     }
 
     // 13. recovery_rate calculation
     #[test]
     fn test_parse_failure_recovery_rate() {
-        let tracker = Tracker::new().expect("Failed to create tracker");
-        let pid = std::process::id();
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let pid = std::process::id();
 
-        // 2 successes, 1 failure
-        tracker
-            .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
-            .unwrap();
-        tracker
-            .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
-            .unwrap();
+            // 2 successes, 1 failure
+            tracker
+                .record_parse_failure(&format!("cmd_ok1_{}", pid), "err", true)
+                .unwrap();
+            tracker
+                .record_parse_failure(&format!("cmd_ok2_{}", pid), "err", true)
+                .unwrap();
+            tracker
+                .record_parse_failure(&format!("cmd_fail_{}", pid), "err", false)
+                .unwrap();
 
-        let summary = tracker.get_parse_failure_summary().unwrap();
-        // We can't assert exact rate because other tests may have added records,
-        // but we can verify recovery_rate is between 0 and 100
-        assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+            let summary = tracker.get_parse_failure_summary().unwrap();
+            // We can't assert exact rate because other tests may have added records,
+            // but we can verify recovery_rate is between 0 and 100
+            assert!(summary.recovery_rate >= 0.0 && summary.recovery_rate <= 100.0);
+        });
+    }
+
+    #[test]
+    fn test_evaluation_summary_counts_and_attempts() {
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let pid = std::process::id();
+
+            tracker
+                .record_evaluation(
+                    &format!("cmd_compressed_{}", pid),
+                    "rtk cmd compressed",
+                    EvaluationOutcome::Compressed,
+                    true,
+                    None,
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("cmd_preserved_{}", pid),
+                    "rtk cmd preserved",
+                    EvaluationOutcome::PreservedRaw,
+                    true,
+                    None,
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("cmd_passthrough_{}", pid),
+                    "rtk cmd passthrough",
+                    EvaluationOutcome::PassthroughExpected,
+                    false,
+                    None,
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("cmd_recovered_{}", pid),
+                    "rtk cmd recovered",
+                    EvaluationOutcome::FallbackRecovered,
+                    false,
+                    Some("clap parse fallback"),
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("cmd_failed_{}", pid),
+                    "rtk cmd failed",
+                    EvaluationOutcome::HardFailure,
+                    false,
+                    Some("fallback exec failed"),
+                )
+                .unwrap();
+
+            let summary = tracker.get_evaluation_summary_filtered(None).unwrap();
+
+            assert_eq!(summary.total_uses, 5);
+            assert_eq!(summary.successful_uses, 3);
+            assert_eq!(summary.failed_uses, 2);
+            assert_eq!(summary.compressed_uses, 1);
+            assert_eq!(summary.preserved_raw_uses, 1);
+            assert_eq!(summary.passthrough_uses, 1);
+            assert_eq!(summary.recovered_failures, 1);
+            assert_eq!(summary.hard_failures, 1);
+            assert_eq!(summary.compression_attempts, 2);
+            assert_eq!(summary.compression_success_rate, 50.0);
+            assert_eq!(summary.top_failed_commands.len(), 2);
+            assert_eq!(summary.recent_failures.len(), 2);
+        });
+    }
+
+    #[test]
+    fn test_timed_execution_records_evaluation_outcomes() {
+        with_tracking_test_db(|| {
+            let timer = TimedExecution::start();
+            timer.track(
+                "cargo test",
+                "rtk cargo test",
+                "raw output",
+                "[summary view]\nok",
+            );
+            timer.track_passthrough_outcome(
+                "git status",
+                "rtk fallback: git status",
+                EvaluationOutcome::FallbackRecovered,
+                Some("clap parse fallback"),
+            );
+
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let summary = tracker.get_evaluation_summary_filtered(None).unwrap();
+
+            assert_eq!(summary.total_uses, 2);
+            assert_eq!(summary.compressed_uses, 1);
+            assert_eq!(summary.passthrough_uses, 0);
+            assert_eq!(summary.recovered_failures, 1);
+            assert_eq!(summary.failed_uses, 1);
+            assert_eq!(summary.compression_attempts, 1);
+        });
+    }
+
+    #[test]
+    fn test_evaluation_summary_counts_actual_compression_attempt_rows() {
+        with_tracking_test_db(|| {
+            let tracker = Tracker::new().expect("Failed to create tracker");
+            let pid = std::process::id();
+
+            tracker
+                .record_evaluation(
+                    &format!("attempted_true_{}", pid),
+                    "rtk compressed",
+                    EvaluationOutcome::Compressed,
+                    true,
+                    None,
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("attempted_false_{}", pid),
+                    "rtk compressed",
+                    EvaluationOutcome::Compressed,
+                    false,
+                    None,
+                )
+                .unwrap();
+            tracker
+                .record_evaluation(
+                    &format!("passthrough_{}", pid),
+                    "rtk passthrough",
+                    EvaluationOutcome::PassthroughExpected,
+                    false,
+                    None,
+                )
+                .unwrap();
+
+            let summary = tracker.get_evaluation_summary_filtered(None).unwrap();
+
+            assert_eq!(summary.total_uses, 3);
+            assert_eq!(summary.compressed_uses, 2);
+            assert_eq!(summary.compression_attempts, 1);
+            assert_eq!(summary.compression_success_rate, 200.0);
+        });
     }
 }

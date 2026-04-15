@@ -4,6 +4,7 @@ pub mod config;
 pub mod constants;
 pub mod display_helpers;
 pub mod filter;
+pub mod policy;
 pub mod runner;
 pub mod tee;
 pub mod telemetry;
